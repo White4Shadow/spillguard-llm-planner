@@ -1,0 +1,431 @@
+diff --git a/include/llama.h b/include/llama.h
+index f723c9f6..d9cc5b22 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -960,6 +960,19 @@ extern "C" {
+             struct llama_context * ctx,
+               struct llama_batch   batch);
+ 
++    // Experimental: migrate a repeating model layer between devices while the
++    // context is alive. Requires loading the model with
++    // LLAMA_EXPERIMENTAL_LAYER_BUFFERS=1 so each layer can release its old
++    // backend buffer independently.
++    // device < 0 targets the CPU backend; otherwise device is an index in the
++    // model's offload-device list.
++    //   0 - success
++    // < 0 - error
++    LLAMA_API int32_t llama_live_migrate_layer(
++            struct llama_context * ctx,
++            int32_t layer,
++            int32_t device);
++
+     // Set the number of threads used for decoding
+     // n_threads is the number of threads used for generation (single token)
+     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 220240ea..1b9d2370 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2055,6 +2055,37 @@ int llama_context::decode(const llama_batch & batch_inp) {
+     return 0;
+ }
+ 
++int llama_context::live_migrate_layer(int il, int device) {
++    ggml_backend_dev_t dev = nullptr;
++    if (device < 0) {
++        dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++    } else if (device < (int) model.devices.size()) {
++        dev = model.devices[device].dev;
++    }
++
++    if (!dev) {
++        LLAMA_LOG_ERROR("%s: invalid target device index %d\n", __func__, device);
++        return -1;
++    }
++
++    synchronize();
++
++    const int ret = const_cast<llama_model &>(model).migrate_layer(il, dev);
++    if (ret != 0) {
++        return ret;
++    }
++
++    if (sched) {
++        ggml_backend_sched_reset(sched.get());
++    }
++    if (gf_res_prev) {
++        gf_res_prev->reset();
++    }
++    sched_need_reserve = true;
++
++    return 0;
++}
++
+ //
+ // output
+ //
+@@ -4062,6 +4093,13 @@ int32_t llama_decode(
+     return ret;
+ }
+ 
++int32_t llama_live_migrate_layer(
++        llama_context * ctx,
++        int32_t layer,
++        int32_t device) {
++    return ctx->live_migrate_layer(layer, device);
++}
++
+ //
+ // perf
+ //
+diff --git a/src/llama-context.h b/src/llama-context.h
+index f8b78058..aa2f1a68 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -142,6 +142,7 @@ struct llama_context {
+ 
+     int encode(const llama_batch & batch_inp);
+     int decode(const llama_batch & batch_inp);
++    int live_migrate_layer(int il, int device);
+ 
+     //
+     // state save/load
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 474cabdf..218c62f0 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -9,6 +9,7 @@
+ #include <array>
+ #include <cinttypes>
+ #include <cstdint>
++#include <cstdlib>
+ #include <cstring>
+ #include <future>
+ #include <regex>
+@@ -1047,10 +1048,24 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
+ struct ggml_tensor * llama_model_loader::create_tensor(
+         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
+         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+-    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+-        auto it = ctx_map.find(buft);
++    if (!experimental_layer_buffers) {
++        const char * env = std::getenv("LLAMA_EXPERIMENTAL_LAYER_BUFFERS");
++        experimental_layer_buffers = env && std::atoi(env) != 0;
++        if (experimental_layer_buffers) {
++            LLAMA_LOG_WARN("%s: LLAMA_EXPERIMENTAL_LAYER_BUFFERS is enabled; repeating layers will be loaded into independent migration buffers\n", __func__);
++        }
++    }
++
++    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft, int32_t layer) -> ggml_context * {
++        tensor_ctx_key key {
++            /*.buft  =*/ buft,
++            /*.layer =*/ experimental_layer_buffers ? layer : -1,
++        };
++
++        auto it = ctx_map.find(key);
+         if (it == ctx_map.end()) {
+-            // one ggml context per buffer type
++            // Default: one ggml context per buffer type.
++            // Experimental migration mode: one ggml context per buffer type and repeating layer.
+             int max_n_tensors = n_tensors;
+             max_n_tensors += 1;                   // duplicated output tensor
+             max_n_tensors += hparams.n_layer()*2; // duplicated rope freq tensors
+@@ -1070,7 +1085,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+                 throw std::runtime_error(format("failed to create ggml context"));
+             }
+ 
+-            ctx_map.emplace(buft, ctx);
++            ctx_map.emplace(key, ctx);
+ 
+             return ctx;
+         }
+@@ -1244,7 +1259,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+ 
+         ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
+         GGML_ASSERT(buft != nullptr);
+-        ggml_context * ctx = ctx_for_buft(buft);
++        ggml_context * ctx = ctx_for_buft(buft, tn.bid);
+         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
+         ggml_set_name(ret, tn.str().c_str());
+         return ret;
+@@ -1255,7 +1270,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+     if (buft == nullptr) {
+         return nullptr; // return type is ggml_tensor *
+     }
+-    ggml_context * ctx = ctx_for_buft(buft);
++    ggml_context * ctx = ctx_for_buft(buft, tn.bid);
+ 
+     // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
+     if (flags & TENSOR_DUPLICATED) {
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index c476026d..daf72dbc 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -103,14 +103,28 @@ struct llama_model_loader {
+     size_t size_data = 0;
+     std::vector<std::pair<size_t, size_t>> mmaps_used;
+ 
+-    // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
+-    struct ggml_backend_buft_comparator {
+-        bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
+-            return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
++    struct tensor_ctx_key {
++        ggml_backend_buffer_type_t buft;
++        int32_t layer;
++    };
++
++    // define a comparator for the context map to ensure that the order is well-defined:
++    struct tensor_ctx_key_comparator {
++        bool operator()(const tensor_ctx_key & lhs, const tensor_ctx_key & rhs) const {
++            const int buft_cmp = strcmp(ggml_backend_buft_name(lhs.buft), ggml_backend_buft_name(rhs.buft));
++            if (buft_cmp != 0) {
++                return buft_cmp < 0;
++            }
++            return lhs.layer < rhs.layer;
+         }
+     };
+ 
+-    std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
++    // env: LLAMA_EXPERIMENTAL_LAYER_BUFFERS
++    // When enabled, repeating-layer tensors are loaded into per-layer contexts so their
++    // backend buffers can be released independently by live layer migration.
++    bool experimental_layer_buffers = false;
++
++    std::map<tensor_ctx_key, ggml_context_ptr, tensor_ctx_key_comparator> ctx_map;
+ 
+     // track tensors that had to be moved for debugging:
+     size_t n_tensors_moved = 0;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 6cb0ec37..cfb43448 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -33,6 +33,7 @@
+ #include <sstream>
+ #include <stdexcept>
+ #include <string>
++#include <unordered_map>
+ #include <vector>
+ 
+ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
+@@ -991,6 +992,12 @@ struct llama_model::impl {
+     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
+     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
+ 
++    // When the model is loaded with LLAMA_EXPERIMENTAL_LAYER_BUFFERS=1, each
++    // repeating layer owns one or more context/buffer entries that can be
++    // replaced and freed independently during generation.
++    bool live_layer_buffers = false;
++    std::vector<std::vector<size_t>> layer_ctxs;
++
+     buft_list_t cpu_buft_list;
+     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
+ 
+@@ -1292,6 +1299,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     for (int il = 0; il < n_layer_all; ++il) {
+         pimpl->dev_layer[il] = get_layer_buft_list(il);
+     }
++    pimpl->layer_ctxs.clear();
++    pimpl->layer_ctxs.resize(n_layer_all);
+ 
+     // assign the output layer
+     pimpl->dev_output = get_layer_buft_list(n_layer_all);
+@@ -1469,6 +1478,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         }
+     }
+     ml.done_getting_tensors();
++    pimpl->live_layer_buffers = ml.experimental_layer_buffers;
+ 
+     // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
+     // If sidecar scales exist, the output weight must be an actual output tensor.
+@@ -1494,7 +1504,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     const size_t n_max_backend_buffer = ml.ctx_map.size() * ml.files.size();
+     pimpl->ctxs_bufs.reserve(n_max_backend_buffer);
+ 
+-    for (auto & [buft, ctx_ptr] : ml.ctx_map) {
++    for (auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
++        ggml_backend_buffer_type_t buft = ctx_key.buft;
+         ggml_context * ctx = ctx_ptr.get();
+ 
+         // skip contexts without tensors
+@@ -1572,7 +1583,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+             ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+         }
+ 
++        const size_t ctxs_bufs_idx = pimpl->ctxs_bufs.size();
+         pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
++        if (ctx_key.layer >= 0 && ctx_key.layer < (int32_t) pimpl->layer_ctxs.size()) {
++            pimpl->layer_ctxs[ctx_key.layer].push_back(ctxs_bufs_idx);
++        }
+ 
+         ctx_buf_maps.emplace_back(ctx, buf_map);
+     }
+@@ -1668,6 +1683,9 @@ llama_split_mode llama_model::split_mode() const {
+ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
+     std::map<ggml_backend_buffer_type_t, size_t> ret;
+     for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
++        if (!ctx || bufs.empty()) {
++            continue;
++        }
+         if (hparams.no_alloc) {
+             GGML_ASSERT(bufs.size() == 1);
+             ggml_backend_buffer_t buf = bufs[0].get();
+@@ -1962,6 +1980,145 @@ ggml_backend_buffer_type_t llama_model::select_buft(int il) const {
+             });
+ }
+ 
++static std::vector<ggml_tensor **> llama_layer_tensor_slots(llama_layer & layer) {
++    std::vector<ggml_tensor **> slots;
++    slots.reserve(sizeof(layer)/sizeof(struct ggml_tensor *));
++    for (size_t i = 0; i < sizeof(layer)/sizeof(struct ggml_tensor *); ++i) {
++        slots.push_back(&reinterpret_cast<struct ggml_tensor **>(&layer)[i]);
++    }
++    return slots;
++}
++
++bool llama_model::supports_live_layer_migration() const {
++    return pimpl->live_layer_buffers;
++}
++
++int llama_model::migrate_layer(int il, ggml_backend_dev_t dev) {
++    if (!pimpl->live_layer_buffers) {
++        LLAMA_LOG_ERROR("%s: model was not loaded with LLAMA_EXPERIMENTAL_LAYER_BUFFERS=1\n", __func__);
++        return -2;
++    }
++    if (il < 0 || il >= (int) layers.size()) {
++        LLAMA_LOG_ERROR("%s: invalid layer %d\n", __func__, il);
++        return -1;
++    }
++    if (!dev) {
++        LLAMA_LOG_ERROR("%s: target device is null\n", __func__);
++        return -1;
++    }
++
++    ggml_backend_buffer_type_t dst_buft = nullptr;
++    buft_list_t * dst_buft_list = nullptr;
++    if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
++        dst_buft = ggml_backend_cpu_buffer_type();
++        dst_buft_list = &pimpl->cpu_buft_list;
++    } else {
++        auto it = pimpl->gpu_buft_list.find(dev);
++        if (it == pimpl->gpu_buft_list.end()) {
++            LLAMA_LOG_ERROR("%s: target device %s is not part of this model\n", __func__, ggml_backend_dev_name(dev));
++            return -1;
++        }
++        dst_buft = ggml_backend_dev_buffer_type(dev);
++        dst_buft_list = &it->second;
++    }
++    if (!dst_buft) {
++        LLAMA_LOG_ERROR("%s: target device %s has no default buffer type\n", __func__, ggml_backend_dev_name(dev));
++        return -1;
++    }
++
++    if (pimpl->dev_layer.at(il).dev == dev) {
++        LLAMA_LOG_DEBUG("%s: layer %d already on %s\n", __func__, il, ggml_backend_dev_name(dev));
++        return 0;
++    }
++
++    if (il >= (int) pimpl->layer_ctxs.size() || pimpl->layer_ctxs[il].empty()) {
++        LLAMA_LOG_ERROR("%s: layer %d has no isolated migration buffer\n", __func__, il);
++        return -2;
++    }
++
++    auto slots = llama_layer_tensor_slots(layers[il]);
++    std::vector<ggml_tensor *> src_tensors;
++    src_tensors.reserve(slots.size());
++    for (auto ** slot : slots) {
++        if (*slot == nullptr) {
++            continue;
++        }
++        if (std::find(src_tensors.begin(), src_tensors.end(), *slot) == src_tensors.end()) {
++            src_tensors.push_back(*slot);
++        }
++    }
++
++    if (src_tensors.empty()) {
++        LLAMA_LOG_ERROR("%s: layer %d has no tensors to migrate\n", __func__, il);
++        return -2;
++    }
++
++    ggml_init_params params = {
++        /*.mem_size   =*/ ggml_tensor_overhead()*(src_tensors.size() + 8),
++        /*.mem_buffer =*/ NULL,
++        /*.no_alloc   =*/ true,
++    };
++
++    ggml_context_ptr dst_ctx { ggml_init(params) };
++    if (!dst_ctx) {
++        LLAMA_LOG_ERROR("%s: failed to create destination context for layer %d\n", __func__, il);
++        return -3;
++    }
++
++    std::unordered_map<ggml_tensor *, ggml_tensor *> replacements;
++    replacements.reserve(src_tensors.size());
++    for (ggml_tensor * src : src_tensors) {
++        ggml_tensor * dst = ggml_dup_tensor(dst_ctx.get(), src);
++        ggml_set_name(dst, ggml_get_name(src));
++        replacements.emplace(src, dst);
++    }
++
++    ggml_backend_buffer_ptr dst_buf { ggml_backend_alloc_ctx_tensors_from_buft(dst_ctx.get(), dst_buft) };
++    if (!dst_buf) {
++        LLAMA_LOG_ERROR("%s: failed to allocate %s buffer for layer %d\n", __func__, ggml_backend_buft_name(dst_buft), il);
++        return -3;
++    }
++    ggml_backend_buffer_set_usage(dst_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++
++    for (auto & [src, dst] : replacements) {
++        ggml_backend_tensor_copy(src, dst);
++    }
++
++    for (auto ** slot : slots) {
++        auto it = replacements.find(*slot);
++        if (it != replacements.end()) {
++            *slot = it->second;
++        }
++    }
++    for (auto & [name, tensor] : tensors_by_name) {
++        auto it = replacements.find(tensor);
++        if (it != replacements.end()) {
++            tensor = it->second;
++        }
++    }
++
++    const size_t dst_idx = pimpl->ctxs_bufs.size();
++    std::vector<ggml_backend_buffer_ptr> dst_bufs;
++    dst_bufs.emplace_back(std::move(dst_buf));
++    pimpl->ctxs_bufs.emplace_back(std::move(dst_ctx), std::move(dst_bufs));
++
++    for (size_t idx : pimpl->layer_ctxs[il]) {
++        if (idx < pimpl->ctxs_bufs.size()) {
++            pimpl->ctxs_bufs[idx].second.clear();
++            pimpl->ctxs_bufs[idx].first.reset();
++        }
++    }
++    pimpl->layer_ctxs[il].clear();
++    pimpl->layer_ctxs[il].push_back(dst_idx);
++    pimpl->dev_layer[il] = { dev, dst_buft_list };
++
++    LLAMA_LOG_INFO("%s: migrated layer %d to %s (%s, %.2f MiB)\n",
++            __func__, il, ggml_backend_dev_name(dev), ggml_backend_buft_name(dst_buft),
++            ggml_backend_buffer_get_size(pimpl->ctxs_bufs[dst_idx].second.front().get()) / 1024.0 / 1024.0);
++
++    return 0;
++}
++
+ bool llama_model::has_tensor_overrides() const {
+     return pimpl->has_tensor_overrides;
+ }
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 77d8d3b6..e81893be 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -632,6 +632,9 @@ struct llama_model {
+ 
+     ggml_backend_buffer_type_t select_buft(int il) const;
+ 
++    bool supports_live_layer_migration() const;
++    int migrate_layer(int il, ggml_backend_dev_t dev);
++
+     bool has_tensor_overrides() const;
+ 
+     const struct ggml_tensor * get_tensor(const char * name) const;

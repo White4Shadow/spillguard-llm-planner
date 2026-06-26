@@ -62,19 +62,41 @@ The innovative angle here is adapting those ideas to a single weak consumer mach
 
 This makes a larger-than-VRAM model more usable without requiring a server cluster, multi-GPU system, or custom model runtime.
 
+## Live Layer Migration Track
+
+The next research goal is true live layer migration inside llama.cpp while generation is running.
+
+That work is separate from the current Python planner. It changes llama.cpp itself so repeating model layers can be loaded into independent backend buffers, copied to another device while the context is alive, and freed from the old device after the graph is reset.
+
+Current artifact:
+
+```text
+patches/llama.cpp/0001-experimental-live-layer-migration.patch
+```
+
+Implementation notes:
+
+```text
+docs/live-layer-migration.md
+```
+
+This patch compiles in a CPU-only MSVC llama.cpp library build. CUDA runtime validation and a `llama-server` controller endpoint are still required before this is production-ready.
+
 ## Repository Layout
 
 ```text
 .
-├── README.md
-├── PRODUCTION_RUNBOOK.md
-├── UNIQUE_APPROACH_PROTOTYPE.md
-├── WEAK_HARDWARE_LLM_REPORT.md
-├── scripts/
-│   ├── weak_llm.py
-│   ├── phase-split-llama.ps1
-│   └── profile-llama-fit.ps1
-└── .gitignore
+|-- README.md
+|-- docs/
+|   `-- live-layer-migration.md
+|-- patches/
+|   `-- llama.cpp/
+|       `-- 0001-experimental-live-layer-migration.patch
+|-- scripts/
+|   |-- weak_llm.py
+|   |-- phase-split-llama.ps1
+|   `-- profile-llama-fit.ps1
+`-- .gitignore
 ```
 
 Ignored local artifacts:
@@ -277,6 +299,7 @@ Runtime checks performed locally:
 ## Limitations
 
 - This is a local orchestration layer around `llama.cpp`, not a new inference engine.
+- The live layer migration patch is experimental and not yet wired into normal `llama-server` usage.
 - Profiles are hardware-specific and should not be reused across machines.
 - Long-running Gemma 31B phase-cache creation can still be slow because process startup and model loading matter.
 - The planner estimates token counts from prompt length when it does not have tokenizer output.
