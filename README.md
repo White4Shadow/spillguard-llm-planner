@@ -80,7 +80,7 @@ Implementation notes:
 docs/live-layer-migration.md
 ```
 
-This patch compiles in a CPU-only MSVC llama.cpp library build. CUDA runtime validation, VRAM-before/after proof, and production-grade policy tuning are still required before this is production-ready.
+This patch compiles in a CPU-only MSVC llama.cpp library build and includes a `llama-live-migration-probe` example for runtime testing. CUDA runtime validation, VRAM-before/after proof, and production-grade policy tuning are still required before this is production-ready.
 
 ## Repository Layout
 

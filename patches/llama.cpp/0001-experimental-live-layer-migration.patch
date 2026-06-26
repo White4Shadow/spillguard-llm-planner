@@ -1,3 +1,247 @@
+diff --git a/examples/CMakeLists.txt b/examples/CMakeLists.txt
+index 39f802d2..135260f1 100644
+--- a/examples/CMakeLists.txt
++++ b/examples/CMakeLists.txt
+@@ -23,6 +23,7 @@ else()
+     add_subdirectory(gguf)
+     add_subdirectory(idle)
+     add_subdirectory(lookahead)
++    add_subdirectory(live-migration-probe)
+     add_subdirectory(lookup)
+     add_subdirectory(parallel)
+     add_subdirectory(passkey)
+diff --git a/examples/live-migration-probe/CMakeLists.txt b/examples/live-migration-probe/CMakeLists.txt
+new file mode 100644
+index 00000000..a79c321b
+--- /dev/null
++++ b/examples/live-migration-probe/CMakeLists.txt
+@@ -0,0 +1,5 @@
++set(TARGET llama-live-migration-probe)
++add_executable(${TARGET} live-migration-probe.cpp)
++install(TARGETS ${TARGET} RUNTIME)
++target_link_libraries(${TARGET} PRIVATE llama ${CMAKE_THREAD_LIBS_INIT})
++target_compile_features(${TARGET} PRIVATE cxx_std_17)
+diff --git a/examples/live-migration-probe/live-migration-probe.cpp b/examples/live-migration-probe/live-migration-probe.cpp
+new file mode 100644
+index 00000000..9dbb920e
+--- /dev/null
++++ b/examples/live-migration-probe/live-migration-probe.cpp
+@@ -0,0 +1,215 @@
++#include "llama.h"
++
++#include "ggml-backend.h"
++
++#include <clocale>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++
++#ifdef _WIN32
++#include <stdlib.h>
++#endif
++
++static void set_env_if_empty(const char * name, const char * value) {
++    if (std::getenv(name)) {
++        return;
++    }
++#ifdef _WIN32
++    _putenv_s(name, value);
++#else
++    setenv(name, value, 0);
++#endif
++}
++
++static void print_usage(char ** argv) {
++    fprintf(stderr,
++        "usage: %s -m model.gguf [-ngl n] [-n tokens] [--layer i] [--migrate-at i] [--target cpu|gpu] [--auto-policy] [prompt]\n",
++        argv[0]);
++}
++
++static ggml_backend_dev_t first_non_cpu_device() {
++    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
++        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
++        if (dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
++            return dev;
++        }
++    }
++    return nullptr;
++}
++
++static void print_device_memory(const char * label, ggml_backend_dev_t dev) {
++    if (!dev) {
++        fprintf(stderr, "probe: %s: device unavailable\n", label);
++        return;
++    }
++
++    size_t free = 0;
++    size_t total = 0;
++    ggml_backend_dev_memory(dev, &free, &total);
++    fprintf(stderr, "probe: %s: %s free %.2f MiB / %.2f MiB\n",
++            label,
++            ggml_backend_dev_name(dev),
++            free/1024.0/1024.0,
++            total/1024.0/1024.0);
++}
++
++int main(int argc, char ** argv) {
++    std::setlocale(LC_NUMERIC, "C");
++
++    std::string model_path;
++    std::string prompt = "Hello my name is";
++    std::string target = "cpu";
++    int ngl = 99;
++    int n_predict = 16;
++    int migrate_layer = -1;
++    int migrate_at = 1;
++    bool auto_policy = false;
++
++    int i = 1;
++    for (; i < argc; ++i) {
++        if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
++            model_path = argv[++i];
++        } else if (strcmp(argv[i], "-ngl") == 0 && i + 1 < argc) {
++            ngl = std::stoi(argv[++i]);
++        } else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
++            n_predict = std::stoi(argv[++i]);
++        } else if (strcmp(argv[i], "--layer") == 0 && i + 1 < argc) {
++            migrate_layer = std::stoi(argv[++i]);
++        } else if (strcmp(argv[i], "--migrate-at") == 0 && i + 1 < argc) {
++            migrate_at = std::stoi(argv[++i]);
++        } else if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) {
++            target = argv[++i];
++        } else if (strcmp(argv[i], "--auto-policy") == 0) {
++            auto_policy = true;
++        } else {
++            break;
++        }
++    }
++
++    if (model_path.empty()) {
++        print_usage(argv);
++        return 1;
++    }
++    if (i < argc) {
++        prompt = argv[i++];
++        for (; i < argc; ++i) {
++            prompt += " ";
++            prompt += argv[i];
++        }
++    }
++
++    set_env_if_empty("LLAMA_EXPERIMENTAL_LAYER_BUFFERS", "1");
++    if (auto_policy) {
++        set_env_if_empty("LLAMA_LIVE_MIGRATION", "1");
++        set_env_if_empty("LLAMA_LIVE_MIGRATION_MIN_FREE_MB", "12000");
++        set_env_if_empty("LLAMA_LIVE_MIGRATION_RESTORE_FREE_MB", "16000");
++        set_env_if_empty("LLAMA_LIVE_MIGRATION_INTERVAL_DECODE", "1");
++    }
++
++    ggml_backend_load_all();
++
++    ggml_backend_dev_t gpu_dev = first_non_cpu_device();
++    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++    print_device_memory("before-load gpu", gpu_dev);
++    print_device_memory("before-load cpu", cpu_dev);
++
++    llama_model_params model_params = llama_model_default_params();
++    model_params.n_gpu_layers = ngl;
++
++    llama_model * model = llama_model_load_from_file(model_path.c_str(), model_params);
++    if (!model) {
++        fprintf(stderr, "probe: failed to load model\n");
++        return 1;
++    }
++
++    if (migrate_layer < 0) {
++        migrate_layer = llama_model_n_layer(model) - 1;
++    }
++
++    const llama_vocab * vocab = llama_model_get_vocab(model);
++    const int n_prompt = -llama_tokenize(vocab, prompt.c_str(), prompt.size(), nullptr, 0, true, true);
++    std::vector<llama_token> prompt_tokens(n_prompt);
++    if (llama_tokenize(vocab, prompt.c_str(), prompt.size(), prompt_tokens.data(), prompt_tokens.size(), true, true) < 0) {
++        fprintf(stderr, "probe: failed to tokenize prompt\n");
++        llama_model_free(model);
++        return 1;
++    }
++
++    llama_context_params ctx_params = llama_context_default_params();
++    ctx_params.n_ctx = n_prompt + n_predict + 16;
++    ctx_params.n_batch = n_prompt;
++    ctx_params.no_perf = false;
++
++    llama_context * ctx = llama_init_from_model(model, ctx_params);
++    if (!ctx) {
++        fprintf(stderr, "probe: failed to create context\n");
++        llama_model_free(model);
++        return 1;
++    }
++
++    auto sparams = llama_sampler_chain_default_params();
++    sparams.no_perf = false;
++    llama_sampler * smpl = llama_sampler_chain_init(sparams);
++    llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
++
++    llama_batch batch = llama_batch_get_one(prompt_tokens.data(), prompt_tokens.size());
++    int n_decode = 0;
++    bool migrated = false;
++
++    print_device_memory("after-load gpu", gpu_dev);
++    print_device_memory("after-load cpu", cpu_dev);
++
++    for (int n_pos = 0; n_pos + batch.n_tokens < n_prompt + n_predict; ) {
++        const int ret = llama_decode(ctx, batch);
++        if (ret != 0) {
++            fprintf(stderr, "probe: llama_decode failed with %d\n", ret);
++            llama_sampler_free(smpl);
++            llama_free(ctx);
++            llama_model_free(model);
++            return 1;
++        }
++
++        n_pos += batch.n_tokens;
++
++        if (!migrated && !auto_policy && n_decode >= migrate_at) {
++            const int target_device = target == "gpu" ? 0 : -1;
++            print_device_memory("before-manual-migration gpu", gpu_dev);
++            fprintf(stderr, "probe: migrating layer %d to %s\n", migrate_layer, target.c_str());
++            const int migrate_ret = llama_live_migrate_layer(ctx, migrate_layer, target_device);
++            fprintf(stderr, "probe: migration_result=%d\n", migrate_ret);
++            print_device_memory("after-manual-migration gpu", gpu_dev);
++            if (migrate_ret != 0) {
++                llama_sampler_free(smpl);
++                llama_free(ctx);
++                llama_model_free(model);
++                return 2;
++            }
++            migrated = true;
++        }
++
++        llama_token new_token_id = llama_sampler_sample(smpl, ctx, -1);
++        if (llama_vocab_is_eog(vocab, new_token_id)) {
++            break;
++        }
++
++        batch = llama_batch_get_one(&new_token_id, 1);
++        n_decode++;
++    }
++
++    print_device_memory("after-decode gpu", gpu_dev);
++    fprintf(stderr, "probe: decoded=%d migrated=%s layer=%d target=%s auto_policy=%s\n",
++            n_decode,
++            migrated ? "true" : "false",
++            migrate_layer,
++            target.c_str(),
++            auto_policy ? "true" : "false");
++
++    llama_sampler_free(smpl);
++    llama_free(ctx);
++    llama_model_free(model);
++
++    return 0;
++}
 diff --git a/include/llama.h b/include/llama.h
 index f723c9f6..d9cc5b22 100644
 --- a/include/llama.h

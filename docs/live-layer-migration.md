@@ -21,6 +21,7 @@ Local validation completed:
 - `git diff --check` passes in the patched llama.cpp source tree.
 - MSVC Release CPU-only `llama` library build passes.
 - The automatic policy compiles into the patched `llama` library.
+- `llama-live-migration-probe` builds and runs against the local Qwen 0.5B GGUF in a CPU-only build, exercising migration-ready load, decode, manual `llama_live_migrate_layer()`, graph reset, and continued decode.
 
 Not completed yet:
 
@@ -141,6 +142,58 @@ CPU-only compile check:
 
 CUDA validation should use the same patch with `-DGGML_CUDA=ON` and then run a migration test against a small GGUF model before trying Gemma 31B.
 
+## Probe Build And Run
+
+The patch adds a probe executable:
+
+```text
+examples/live-migration-probe/live-migration-probe.cpp
+```
+
+Build it from the patched llama.cpp tree:
+
+```powershell
+& "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" `
+  -S . `
+  -B build-live-migration `
+  -G "Visual Studio 17 2022" `
+  -A x64 `
+  -DGGML_CUDA=OFF `
+  -DGGML_NATIVE=OFF `
+  -DLLAMA_BUILD_EXAMPLES=ON `
+  -DLLAMA_BUILD_SERVER=OFF `
+  -DLLAMA_BUILD_TESTS=OFF
+```
+
+```powershell
+& "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" `
+  --build build-live-migration `
+  --config Release `
+  --target llama-live-migration-probe
+```
+
+CPU-only smoke run used locally:
+
+```powershell
+$env:LLAMA_EXPERIMENTAL_LAYER_BUFFERS = "1"
+.\build-live-migration\bin\Release\llama-live-migration-probe.exe `
+  -m C:\Users\fteki\Documents\LLM\models\qwen2.5-0.5b-instruct-gguf\qwen2.5-0.5b-instruct-q4_k_m.gguf `
+  -ngl 0 `
+  -n 4 `
+  --migrate-at 0 `
+  --target cpu `
+  "Hello"
+```
+
+Observed result:
+
+```text
+probe: migration_result=0
+probe: decoded=4 migrated=true layer=23 target=cpu auto_policy=false
+```
+
+In the CPU-only build the layer is already on CPU, so this is only a runtime smoke test. The same probe is intended for CUDA validation with `-DGGML_CUDA=ON`, `-ngl` greater than zero, and `--target cpu`, where the `before/after` GPU memory lines should prove whether VRAM is actually released.
+
 ## Runtime Use
 
 The patch exposes the migration primitive for explicit control:
@@ -155,7 +208,7 @@ The built-in automatic policy does not require a server endpoint, but a producti
 ## Next Engineering Steps
 
 1. Build the patched tree with CUDA enabled.
-2. Add a tiny test executable that loads a small GGUF model with `LLAMA_EXPERIMENTAL_LAYER_BUFFERS=1`, decodes one token, migrates one layer to CPU, decodes again, and verifies output does not crash.
+2. Run `llama-live-migration-probe` with a CUDA build and a small GGUF model.
 3. Log VRAM before and after migration to prove old CUDA memory is released.
 4. Add a test executable or server route that forces migration deterministically for debugging.
 5. Extend the policy with CPU utilization and latency-aware decisions.
