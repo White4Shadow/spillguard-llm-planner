@@ -28,7 +28,7 @@ Not completed yet:
 - CUDA build validation.
 - Runtime migration test with a real GGUF model.
 - VRAM-before/after proof on a CUDA backend.
-- CPU utilization pressure is not handled yet; the built-in policy currently uses VRAM and CPU RAM thresholds.
+- Latency-aware migration decisions are not handled yet; the built-in policy currently uses VRAM, CPU RAM, and CPU utilization thresholds.
 
 ## What Is New
 
@@ -53,7 +53,7 @@ int32_t llama_live_migrate_layer(
 
 `device < 0` means CPU. `device >= 0` means the index in the model offload-device list.
 
-The patch now also includes an opt-in live policy inside `llama_context`. When enabled, it checks memory at the end of successful `llama_decode()` calls, demotes one GPU layer to CPU under VRAM pressure, and promotes only layers it previously demoted after VRAM recovers.
+The patch now also includes an opt-in live policy inside `llama_context`. When enabled, it checks memory and CPU utilization at the end of successful `llama_decode()` calls, demotes one GPU layer to CPU under VRAM pressure, and promotes only layers it previously demoted after VRAM recovers.
 
 ## How Migration Works
 
@@ -86,6 +86,7 @@ Optional thresholds:
 $env:LLAMA_LIVE_MIGRATION_MIN_FREE_MB = "768"
 $env:LLAMA_LIVE_MIGRATION_RESTORE_FREE_MB = "2048"
 $env:LLAMA_LIVE_MIGRATION_MIN_RAM_FREE_MB = "2048"
+$env:LLAMA_LIVE_MIGRATION_MAX_CPU_PCT = "85"
 $env:LLAMA_LIVE_MIGRATION_INTERVAL_DECODE = "1"
 ```
 
@@ -93,6 +94,7 @@ Policy behavior:
 
 - if free VRAM on the first non-CPU model device drops below `LLAMA_LIVE_MIGRATION_MIN_FREE_MB`, demote one currently GPU-resident layer to CPU;
 - skip demotion when CPU RAM is below `LLAMA_LIVE_MIGRATION_MIN_RAM_FREE_MB`;
+- skip demotion when live CPU utilization is above `LLAMA_LIVE_MIGRATION_MAX_CPU_PCT`;
 - if free VRAM rises above `LLAMA_LIVE_MIGRATION_RESTORE_FREE_MB`, promote the most recently policy-demoted layer back to GPU;
 - use hysteresis so the policy does not immediately bounce the same layer back and forth;
 - run only after a successful decode, so the next decode builds a fresh graph with the new placement.
@@ -203,7 +205,7 @@ llama_live_migrate_layer(ctx, layer_id, -1); // move layer to CPU
 llama_live_migrate_layer(ctx, layer_id,  0); // move layer to first model GPU
 ```
 
-The built-in automatic policy does not require a server endpoint, but a production controller could still improve decisions by adding decode latency, migration copy time, CPU utilization, and workload-specific rules.
+The built-in automatic policy does not require a server endpoint, but a production controller could still improve decisions by adding decode latency, migration copy time, and workload-specific rules.
 
 ## Next Engineering Steps
 
@@ -211,7 +213,7 @@ The built-in automatic policy does not require a server endpoint, but a producti
 2. Run `llama-live-migration-probe` with a CUDA build and a small GGUF model.
 3. Log VRAM before and after migration to prove old CUDA memory is released.
 4. Add a test executable or server route that forces migration deterministically for debugging.
-5. Extend the policy with CPU utilization and latency-aware decisions.
+5. Extend the policy with latency-aware decisions and migration copy-time accounting.
 6. Benchmark Gemma 31B Q4 on the RTX 3060 and compare against the current best static `-ngl 40` result.
 
 ## Why This Is Different From The Planner

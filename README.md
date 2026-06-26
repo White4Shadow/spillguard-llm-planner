@@ -66,7 +66,7 @@ This makes a larger-than-VRAM model more usable without requiring a server clust
 
 The next research goal is true live layer migration inside llama.cpp while generation is running.
 
-That work is separate from the current Python planner. It changes llama.cpp itself so repeating model layers can be loaded into independent backend buffers, copied to another device while the context is alive, and freed from the old device after the graph is reset. The patch also includes an opt-in live policy that checks VRAM/RAM after successful decode calls and moves one layer at a time.
+That work is separate from the current Python planner. It changes llama.cpp itself so repeating model layers can be loaded into independent backend buffers, copied to another device while the context is alive, and freed from the old device after the graph is reset. The patch also includes an opt-in live policy that checks VRAM, CPU RAM, and CPU utilization after successful decode calls and moves one layer at a time.
 
 Current artifact:
 
