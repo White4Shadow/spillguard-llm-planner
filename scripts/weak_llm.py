@@ -1100,6 +1100,13 @@ def cmd_serve_command(args: argparse.Namespace) -> None:
     print(quote_ps(argv))
 
 
+def cmd_serve(args: argparse.Namespace) -> None:
+    argv = cli_command(args, server=True)
+    print(f"starting: {quote_ps(argv)}", file=sys.stderr)
+    completed = subprocess.run(argv, cwd=ROOT)
+    raise SystemExit(completed.returncode)
+
+
 def cmd_phase_command(args: argparse.Namespace) -> None:
     model = ensure_file(Path(args.model), "model")
     server = ensure_file(Path(args.llama_server), "llama-server")
@@ -1229,6 +1236,12 @@ def build_parser() -> argparse.ArgumentParser:
     serve_cmd.add_argument("--port", type=int, default=8080)
     serve_cmd.add_argument("--slot-dir", default=str(DEFAULT_SLOT_DIR))
     serve_cmd.set_defaults(func=cmd_serve_command)
+
+    serve = sub.add_parser("serve", parents=[common_run], help="Start llama-server with the stored recommendation.")
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8080)
+    serve.add_argument("--slot-dir", default=str(DEFAULT_SLOT_DIR))
+    serve.set_defaults(func=cmd_serve)
 
     phase_cmd = sub.add_parser(
         "phase-command",

@@ -140,7 +140,22 @@ python .\scripts\weak_llm.py recommend `
   --model .\models\gemma-4-31b-it-qat-q4_0-gguf\gemma-4-31B_q4_0-it.gguf
 ```
 
-Generate a normal server command:
+Start a normal server:
+
+```powershell
+python .\scripts\weak_llm.py serve `
+  --model .\models\gemma-4-31b-it-qat-q4_0-gguf\gemma-4-31B_q4_0-it.gguf `
+  --context 4096 `
+  --port 8080
+```
+
+Keep that PowerShell window open while using the model. When the server is ready, open:
+
+```text
+http://127.0.0.1:8080
+```
+
+If you only want to print the underlying `llama-server.exe` command without starting it, use:
 
 ```powershell
 python .\scripts\weak_llm.py serve-command `
