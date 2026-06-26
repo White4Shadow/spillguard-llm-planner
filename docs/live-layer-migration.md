@@ -22,13 +22,16 @@ Local validation completed:
 - MSVC Release CPU-only `llama` library build passes.
 - The automatic policy compiles into the patched `llama` library.
 - `llama-live-migration-probe` builds and runs against the local Qwen 0.5B GGUF in a CPU-only build, exercising migration-ready load, decode, manual `llama_live_migrate_layer()`, graph reset, and continued decode.
+- CUDA Toolkit 13.3 builds the patched probe for RTX 3060 architecture `86`.
+- CUDA manual migration proof passes on RTX 3060: layer 23 moved from CUDA0 to CPU during generation, free GPU memory increased by 10 MiB, and decode continued.
+- CUDA automatic pressure policy proof passes with an intentionally high VRAM threshold: the policy demoted layers 23, 22, 21, and 20 while decode continued.
 
-Not completed yet:
+Future hardening still left:
 
-- CUDA build validation.
-- Runtime migration test with a real GGUF model.
-- VRAM-before/after proof on a CUDA backend.
-- Decode-latency-aware migration decisions are not handled yet; the built-in policy currently uses VRAM, CPU RAM, CPU utilization, and migration-copy-time thresholds.
+- Gemma 31B benchmark against the best static `-ngl` baseline.
+- Long-run stress testing with larger contexts and many migration cycles.
+- Cross-GPU/CUDA-version validation beyond the RTX 3060 local proof.
+- Decode-latency SLO policy tuning; the built-in policy currently uses VRAM, CPU RAM, CPU utilization, and migration-copy-time thresholds.
 
 ## What Is New
 
@@ -216,16 +219,43 @@ For a strict CUDA proof, use the probe's GPU checks:
 
 `--require-gpu` fails the run if no non-CPU backend is available. `--expect-gpu-delta-mb` fails the run if GPU free memory does not increase by at least that many MiB after the manual layer migration. For larger models, raise the expected delta after observing the per-layer buffer size in the probe logs.
 
+Observed local CUDA result on RTX 3060:
+
+```text
+probe: before-manual-migration gpu: CUDA0 free 10971.00 MiB / 12287.50 MiB
+probe: migrating layer 23 to cpu
+migrate_layer: migrated layer 23 to CPU (CPU, 9.27 MiB)
+live_migrate_layer: migrated layer 23 to CPU in 2.61 ms (avg 2.61 ms, max 2.61 ms, count 1)
+probe: migration_result=0
+probe: after-manual-migration gpu: CUDA0 free 10981.00 MiB / 12287.50 MiB
+probe: gpu_free_delta_after_migration=10.00 MiB required=1.00 MiB
+probe: decoded=4 migrated=true layer=23 target=cpu auto_policy=false
+```
+
 The repository also includes a wrapper for the same strict check:
 
 ```powershell
-.\scripts\cuda-live-migration-check.ps1 `
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\cuda-live-migration-check.ps1 `
   -Model .\models\qwen2.5-0.5b-instruct-gguf\qwen2.5-0.5b-instruct-q4_k_m.gguf `
   -GpuLayers 12 `
+  -CudaArchitecture 86 `
   -MinGpuDeltaMb 1
 ```
 
-The wrapper requires `nvcc` on `PATH`, configures a CUDA build with `GGML_CUDA=ON`, builds `llama-live-migration-probe`, and fails unless the probe observes the required increase in free GPU memory.
+The wrapper locates CUDA Toolkit under `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA`, configures a CUDA build with `GGML_CUDA=ON`, builds `llama-live-migration-probe`, and fails unless the probe observes the required increase in free GPU memory.
+
+Automatic policy proof command:
+
+```powershell
+.\build-live-migration-cuda\bin\Release\llama-live-migration-probe.exe `
+  -m C:\Users\fteki\Documents\LLM\models\qwen2.5-0.5b-instruct-gguf\qwen2.5-0.5b-instruct-q4_k_m.gguf `
+  -ngl 12 `
+  -n 4 `
+  --auto-policy `
+  "Hello"
+```
+
+Observed local result: the policy saw free VRAM below the forced threshold, demoted layers 23, 22, 21, and 20 to CPU, logged migration copy times around 2.5-2.9 ms per layer, reset the scheduler after each move, and completed decode.
 
 ## Runtime Use
 
@@ -236,16 +266,15 @@ llama_live_migrate_layer(ctx, layer_id, -1); // move layer to CPU
 llama_live_migrate_layer(ctx, layer_id,  0); // move layer to first model GPU
 ```
 
-The built-in automatic policy does not require a server endpoint, but a production controller could still improve decisions by adding decode latency and workload-specific rules.
+The built-in automatic policy does not require a server endpoint, but a production controller could still improve decisions by adding strict decode-latency SLOs and workload-specific rules.
 
 ## Next Engineering Steps
 
-1. Build the patched tree with CUDA enabled.
-2. Run `llama-live-migration-probe` with a CUDA build and a small GGUF model.
-3. Log VRAM before and after migration to prove old CUDA memory is released.
-4. Add a test executable or server route that forces migration deterministically for debugging.
-5. Extend the policy with decode-latency-aware decisions.
-6. Benchmark Gemma 31B Q4 on the RTX 3060 and compare against the current best static `-ngl 40` result.
+1. Run a larger Gemma 31B Q4 benchmark on the RTX 3060 and compare against the current best static `-ngl 40` result.
+2. Stress test repeated demote/promote cycles over long contexts.
+3. Add a server route or debug endpoint that forces migration deterministically without a separate probe executable.
+4. Extend the policy with strict decode-latency SLOs.
+5. Validate the patch against another CUDA version and GPU architecture.
 
 ## Why This Is Different From The Planner
 

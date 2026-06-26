@@ -64,7 +64,7 @@ This makes a larger-than-VRAM model more usable without requiring a server clust
 
 ## Live Layer Migration Track
 
-The next research goal is true live layer migration inside llama.cpp while generation is running.
+The active research track is true live layer migration inside llama.cpp while generation is running.
 
 That work is separate from the current Python planner. It changes llama.cpp itself so repeating model layers can be loaded into independent backend buffers, copied to another device while the context is alive, and freed from the old device after the graph is reset. The patch also includes an opt-in live policy that checks VRAM, CPU RAM, CPU utilization, and migration copy time after successful decode calls and moves one layer at a time.
 
@@ -80,7 +80,7 @@ Implementation notes:
 docs/live-layer-migration.md
 ```
 
-This patch compiles in a CPU-only MSVC llama.cpp library build and includes a `llama-live-migration-probe` example for runtime testing. CUDA runtime validation, VRAM-before/after proof, and production-grade policy tuning are still required before this is production-ready.
+This patch compiles in CPU-only and CUDA MSVC llama.cpp builds and includes a `llama-live-migration-probe` example for runtime testing. On the RTX 3060 validation machine, the probe moved a live CUDA layer to CPU during generation, GPU free memory increased by 10 MiB, and decoding continued. The automatic pressure policy also demoted layers under a forced VRAM threshold. Production-grade long-run stress testing and Gemma 31B benchmarking are still future work.
 
 ## Repository Layout
 
@@ -95,7 +95,8 @@ This patch compiles in a CPU-only MSVC llama.cpp library build and includes a `l
 |-- scripts/
 |   |-- weak_llm.py
 |   |-- phase-split-llama.ps1
-|   `-- profile-llama-fit.ps1
+|   |-- profile-llama-fit.ps1
+|   `-- cuda-live-migration-check.ps1
 `-- .gitignore
 ```
 
