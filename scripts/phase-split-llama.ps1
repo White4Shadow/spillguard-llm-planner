@@ -14,7 +14,9 @@ param(
     [int]$PortBase = 18100,
     [switch]$CompareCold,
     [string]$OutDir = ".\benchmarks",
-    [string]$SlotDir = ".\phase-cache"
+    [string]$SlotDir = ".\phase-cache",
+    [string]$SlotFile = "",
+    [switch]$UseExistingSlot
 )
 
 $ErrorActionPreference = "Stop"
@@ -112,33 +114,54 @@ if ($PromptFile) {
 }
 
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$slotFile = "phase-split-$stamp.bin"
+if ($SlotFile) {
+    if ([System.IO.Path]::IsPathRooted($SlotFile)) {
+        $slotFile = [System.IO.Path]::GetFileName($SlotFile)
+    } else {
+        $slotFile = $SlotFile
+    }
+} else {
+    $slotFile = "phase-split-$stamp.bin"
+}
+
+if ($UseExistingSlot) {
+    $existingSlot = Join-Path $slotDirPath $slotFile
+    if (-not (Test-Path -LiteralPath $existingSlot)) {
+        throw "existing slot file not found under SlotDir: $existingSlot"
+    }
+}
+
 $resultPath = Join-Path $OutDir "$stamp-phase-split-result.json"
 $summaryPath = Join-Path $OutDir "$stamp-phase-split-summary.md"
 $prefillServer = $null
 $decodeServer = $null
 $coldServer = $null
+$prefillReadyMs = 0
+$prefill = $null
+$save = $null
 
 try {
-    $prefillServer = Start-LlamaServer -ServerPath $serverPath -ModelPath $modelPath -Port $PortBase `
-        -GpuLayers $PrefillGpuLayers -CacheType $CacheType -ContextSize $ContextSize -SlotDir $slotDirPath `
-        -LogPrefix "$stamp-prefill"
-    $prefillReadyMs = $prefillServer.ready_ms
+    if (-not $UseExistingSlot) {
+        $prefillServer = Start-LlamaServer -ServerPath $serverPath -ModelPath $modelPath -Port $PortBase `
+            -GpuLayers $PrefillGpuLayers -CacheType $CacheType -ContextSize $ContextSize -SlotDir $slotDirPath `
+            -LogPrefix "$stamp-prefill"
+        $prefillReadyMs = $prefillServer.ready_ms
 
-    $prefill = Invoke-JsonPost -Uri "http://127.0.0.1:$PortBase/completion" -Body @{
-        prompt = $prompt
-        n_predict = 0
-        id_slot = 0
-        cache_prompt = $true
-        response_fields = @("tokens_evaluated", "tokens_cached", "timings")
+        $prefill = Invoke-JsonPost -Uri "http://127.0.0.1:$PortBase/completion" -Body @{
+            prompt = $prompt
+            n_predict = 0
+            id_slot = 0
+            cache_prompt = $true
+            response_fields = @("tokens_evaluated", "tokens_cached", "timings")
+        }
+
+        $save = Invoke-JsonPost -Uri "http://127.0.0.1:$PortBase/slots/0?action=save" -Body @{
+            filename = $slotFile
+        }
+
+        Stop-ServerProcess $prefillServer.process
+        $prefillServer = $null
     }
-
-    $save = Invoke-JsonPost -Uri "http://127.0.0.1:$PortBase/slots/0?action=save" -Body @{
-        filename = $slotFile
-    }
-
-    Stop-ServerProcess $prefillServer.process
-    $prefillServer = $null
 
     $decodePort = $PortBase + 1
     $decodeServer = Start-LlamaServer -ServerPath $serverPath -ModelPath $modelPath -Port $decodePort `
@@ -183,13 +206,10 @@ try {
         $coldServer = $null
     }
 
-    $phaseOneOffMs =
-        $prefillReadyMs +
-        $prefill.elapsed_ms +
-        $save.elapsed_ms +
-        $decodeReadyMs +
-        $restore.elapsed_ms +
-        $decode.elapsed_ms
+    $phaseOneOffMs = $decodeReadyMs + $restore.elapsed_ms + $decode.elapsed_ms
+    if (-not $UseExistingSlot) {
+        $phaseOneOffMs += $prefillReadyMs + $prefill.elapsed_ms + $save.elapsed_ms
+    }
     $coldOneOffMs = $null
     $cachedDecodeSavingMs = $null
     $breakEvenLoadedReuses = $null
@@ -197,8 +217,12 @@ try {
         $coldOneOffMs = $coldReadyMs + $cold.elapsed_ms
         $cachedDecodeSavingMs = $cold.elapsed_ms - $decode.elapsed_ms
         if ($cachedDecodeSavingMs -gt 0) {
-            $cacheCreationMs = $prefill.elapsed_ms + $save.elapsed_ms + $restore.elapsed_ms
-            $breakEvenLoadedReuses = [math]::Ceiling($cacheCreationMs / $cachedDecodeSavingMs)
+            if ($UseExistingSlot) {
+                $breakEvenLoadedReuses = 0
+            } else {
+                $cacheCreationMs = $prefill.elapsed_ms + $save.elapsed_ms + $restore.elapsed_ms
+                $breakEvenLoadedReuses = [math]::Ceiling($cacheCreationMs / $cachedDecodeSavingMs)
+            }
         }
     }
 
@@ -211,14 +235,15 @@ try {
         prefill_gpu_layers = $PrefillGpuLayers
         decode_gpu_layers = $DecodeGpuLayers
         decode_prompt_mode = $DecodePromptMode
+        used_existing_slot = $UseExistingSlot.IsPresent
         slot_file = Join-Path $slotDirPath $slotFile
         prefill_server_ready_ms = $prefillReadyMs
-        prefill_elapsed_ms = $prefill.elapsed_ms
-        prefill_tokens_evaluated = $prefill.response.tokens_evaluated
-        prefill_tokens_cached = $prefill.response.tokens_cached
-        save_elapsed_ms = $save.elapsed_ms
-        save_n_saved = $save.response.n_saved
-        save_n_written = $save.response.n_written
+        prefill_elapsed_ms = if ($prefill) { $prefill.elapsed_ms } else { $null }
+        prefill_tokens_evaluated = if ($prefill) { $prefill.response.tokens_evaluated } else { $null }
+        prefill_tokens_cached = if ($prefill) { $prefill.response.tokens_cached } else { $null }
+        save_elapsed_ms = if ($save) { $save.elapsed_ms } else { $null }
+        save_n_saved = if ($save) { $save.response.n_saved } else { $null }
+        save_n_written = if ($save) { $save.response.n_written } else { $null }
         decode_server_ready_ms = $decodeReadyMs
         restore_elapsed_ms = $restore.elapsed_ms
         restore_n_restored = $restore.response.n_restored
@@ -258,10 +283,13 @@ try {
     "Decode ``-ngl``: $DecodeGpuLayers" | Add-Content -LiteralPath $summaryPath
     "Decode prompt mode: $DecodePromptMode" | Add-Content -LiteralPath $summaryPath
     "Cache type: $CacheType" | Add-Content -LiteralPath $summaryPath
+    "Used existing slot: $($UseExistingSlot.IsPresent)" | Add-Content -LiteralPath $summaryPath
     "Prompt chars: $($prompt.Length)" | Add-Content -LiteralPath $summaryPath
     "" | Add-Content -LiteralPath $summaryPath
-    "Prefill tokens evaluated: $($result.prefill_tokens_evaluated)" | Add-Content -LiteralPath $summaryPath
-    "Saved slot tokens: $($result.save_n_saved)" | Add-Content -LiteralPath $summaryPath
+    if (-not $UseExistingSlot) {
+        "Prefill tokens evaluated: $($result.prefill_tokens_evaluated)" | Add-Content -LiteralPath $summaryPath
+        "Saved slot tokens: $($result.save_n_saved)" | Add-Content -LiteralPath $summaryPath
+    }
     "Restored slot tokens: $($result.restore_n_restored)" | Add-Content -LiteralPath $summaryPath
     "Phase decode prompt ms: $($result.phase_decode_prompt_ms)" | Add-Content -LiteralPath $summaryPath
     "Phase decode tok/s: $($result.phase_decode_predicted_per_second)" | Add-Content -LiteralPath $summaryPath

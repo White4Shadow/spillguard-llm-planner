@@ -1,7 +1,12 @@
 models/
 tools/
+__pycache__/
+*.pyc
 benchmarks/*.json
 benchmarks/*.jsonl
 benchmarks/*.log
 benchmarks/*.md
 phase-cache*/
+profiles/*.json
+profiles/*.jsonl
+profiles/*.md
