@@ -66,7 +66,7 @@ This makes a larger-than-VRAM model more usable without requiring a server clust
 
 The next research goal is true live layer migration inside llama.cpp while generation is running.
 
-That work is separate from the current Python planner. It changes llama.cpp itself so repeating model layers can be loaded into independent backend buffers, copied to another device while the context is alive, and freed from the old device after the graph is reset.
+That work is separate from the current Python planner. It changes llama.cpp itself so repeating model layers can be loaded into independent backend buffers, copied to another device while the context is alive, and freed from the old device after the graph is reset. The patch also includes an opt-in live policy that checks VRAM/RAM after successful decode calls and moves one layer at a time.
 
 Current artifact:
 
@@ -80,7 +80,7 @@ Implementation notes:
 docs/live-layer-migration.md
 ```
 
-This patch compiles in a CPU-only MSVC llama.cpp library build. CUDA runtime validation and a `llama-server` controller endpoint are still required before this is production-ready.
+This patch compiles in a CPU-only MSVC llama.cpp library build. CUDA runtime validation, VRAM-before/after proof, and production-grade policy tuning are still required before this is production-ready.
 
 ## Repository Layout
 
@@ -299,7 +299,7 @@ Runtime checks performed locally:
 ## Limitations
 
 - This is a local orchestration layer around `llama.cpp`, not a new inference engine.
-- The live layer migration patch is experimental and not yet wired into normal `llama-server` usage.
+- The live layer migration patch is experimental and still needs CUDA runtime validation.
 - Profiles are hardware-specific and should not be reused across machines.
 - Long-running Gemma 31B phase-cache creation can still be slow because process startup and model loading matter.
 - The planner estimates token counts from prompt length when it does not have tokenizer output.
