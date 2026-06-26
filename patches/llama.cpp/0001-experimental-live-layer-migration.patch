@@ -23,10 +23,10 @@ index 00000000..a79c321b
 +target_compile_features(${TARGET} PRIVATE cxx_std_17)
 diff --git a/examples/live-migration-probe/live-migration-probe.cpp b/examples/live-migration-probe/live-migration-probe.cpp
 new file mode 100644
-index 00000000..9dbb920e
+index 00000000..93843de8
 --- /dev/null
 +++ b/examples/live-migration-probe/live-migration-probe.cpp
-@@ -0,0 +1,215 @@
+@@ -0,0 +1,266 @@
 +#include "llama.h"
 +
 +#include "ggml-backend.h"
@@ -55,7 +55,7 @@ index 00000000..9dbb920e
 +
 +static void print_usage(char ** argv) {
 +    fprintf(stderr,
-+        "usage: %s -m model.gguf [-ngl n] [-n tokens] [--layer i] [--migrate-at i] [--target cpu|gpu] [--auto-policy] [prompt]\n",
++        "usage: %s -m model.gguf [-ngl n] [-n tokens] [--layer i] [--migrate-at i] [--target cpu|gpu] [--auto-policy] [--require-gpu] [--expect-gpu-delta-mb n] [prompt]\n",
 +        argv[0]);
 +}
 +
@@ -69,15 +69,23 @@ index 00000000..9dbb920e
 +    return nullptr;
 +}
 +
-+static void print_device_memory(const char * label, ggml_backend_dev_t dev) {
++static bool read_device_memory(ggml_backend_dev_t dev, size_t & free, size_t & total) {
 +    if (!dev) {
++        return false;
++    }
++    free = 0;
++    total = 0;
++    ggml_backend_dev_memory(dev, &free, &total);
++    return total != 0;
++}
++
++static void print_device_memory(const char * label, ggml_backend_dev_t dev) {
++    size_t free = 0;
++    size_t total = 0;
++    if (!read_device_memory(dev, free, total)) {
 +        fprintf(stderr, "probe: %s: device unavailable\n", label);
 +        return;
 +    }
-+
-+    size_t free = 0;
-+    size_t total = 0;
-+    ggml_backend_dev_memory(dev, &free, &total);
 +    fprintf(stderr, "probe: %s: %s free %.2f MiB / %.2f MiB\n",
 +            label,
 +            ggml_backend_dev_name(dev),
@@ -96,6 +104,8 @@ index 00000000..9dbb920e
 +    int migrate_layer = -1;
 +    int migrate_at = 1;
 +    bool auto_policy = false;
++    bool require_gpu = false;
++    double expect_gpu_delta_mb = -1.0;
 +
 +    int i = 1;
 +    for (; i < argc; ++i) {
@@ -113,6 +123,10 @@ index 00000000..9dbb920e
 +            target = argv[++i];
 +        } else if (strcmp(argv[i], "--auto-policy") == 0) {
 +            auto_policy = true;
++        } else if (strcmp(argv[i], "--require-gpu") == 0) {
++            require_gpu = true;
++        } else if (strcmp(argv[i], "--expect-gpu-delta-mb") == 0 && i + 1 < argc) {
++            expect_gpu_delta_mb = std::stod(argv[++i]);
 +        } else {
 +            break;
 +        }
@@ -144,6 +158,10 @@ index 00000000..9dbb920e
 +    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
 +    print_device_memory("before-load gpu", gpu_dev);
 +    print_device_memory("before-load cpu", cpu_dev);
++    if (require_gpu && !gpu_dev) {
++        fprintf(stderr, "probe: --require-gpu was set but no non-CPU backend device is available\n");
++        return 3;
++    }
 +
 +    llama_model_params model_params = llama_model_default_params();
 +    model_params.n_gpu_layers = ngl;
@@ -205,16 +223,49 @@ index 00000000..9dbb920e
 +
 +        if (!migrated && !auto_policy && n_decode >= migrate_at) {
 +            const int target_device = target == "gpu" ? 0 : -1;
++            size_t free_gpu_before = 0;
++            size_t total_gpu_before = 0;
++            const bool have_gpu_before = read_device_memory(gpu_dev, free_gpu_before, total_gpu_before);
 +            print_device_memory("before-manual-migration gpu", gpu_dev);
 +            fprintf(stderr, "probe: migrating layer %d to %s\n", migrate_layer, target.c_str());
 +            const int migrate_ret = llama_live_migrate_layer(ctx, migrate_layer, target_device);
 +            fprintf(stderr, "probe: migration_result=%d\n", migrate_ret);
++            size_t free_gpu_after = 0;
++            size_t total_gpu_after = 0;
++            const bool have_gpu_after = read_device_memory(gpu_dev, free_gpu_after, total_gpu_after);
 +            print_device_memory("after-manual-migration gpu", gpu_dev);
 +            if (migrate_ret != 0) {
 +                llama_sampler_free(smpl);
 +                llama_free(ctx);
 +                llama_model_free(model);
 +                return 2;
++            }
++            if (expect_gpu_delta_mb >= 0.0) {
++                if (target != "cpu") {
++                    fprintf(stderr, "probe: --expect-gpu-delta-mb requires --target cpu\n");
++                    llama_sampler_free(smpl);
++                    llama_free(ctx);
++                    llama_model_free(model);
++                    return 3;
++                }
++                if (!have_gpu_before || !have_gpu_after) {
++                    fprintf(stderr, "probe: cannot verify GPU memory release because GPU memory stats are unavailable\n");
++                    llama_sampler_free(smpl);
++                    llama_free(ctx);
++                    llama_model_free(model);
++                    return 3;
++                }
++                const double free_delta_mb = ((double) free_gpu_after - (double) free_gpu_before)/1024.0/1024.0;
++                fprintf(stderr, "probe: gpu_free_delta_after_migration=%.2f MiB required=%.2f MiB\n",
++                        free_delta_mb,
++                        expect_gpu_delta_mb);
++                if (free_delta_mb < expect_gpu_delta_mb) {
++                    fprintf(stderr, "probe: GPU free memory did not increase enough after migration\n");
++                    llama_sampler_free(smpl);
++                    llama_free(ctx);
++                    llama_model_free(model);
++                    return 3;
++                }
 +            }
 +            migrated = true;
 +        }

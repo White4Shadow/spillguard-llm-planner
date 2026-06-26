@@ -200,6 +200,33 @@ probe: decoded=4 migrated=true layer=23 target=cpu auto_policy=false
 
 In the CPU-only build the layer is already on CPU, so this is only a runtime smoke test. The same probe is intended for CUDA validation with `-DGGML_CUDA=ON`, `-ngl` greater than zero, and `--target cpu`, where the `before/after` GPU memory lines should prove whether VRAM is actually released.
 
+For a strict CUDA proof, use the probe's GPU checks:
+
+```powershell
+.\build-live-migration-cuda\bin\Release\llama-live-migration-probe.exe `
+  -m C:\Users\fteki\Documents\LLM\models\qwen2.5-0.5b-instruct-gguf\qwen2.5-0.5b-instruct-q4_k_m.gguf `
+  -ngl 12 `
+  -n 4 `
+  --migrate-at 0 `
+  --target cpu `
+  --require-gpu `
+  --expect-gpu-delta-mb 1 `
+  "Hello"
+```
+
+`--require-gpu` fails the run if no non-CPU backend is available. `--expect-gpu-delta-mb` fails the run if GPU free memory does not increase by at least that many MiB after the manual layer migration. For larger models, raise the expected delta after observing the per-layer buffer size in the probe logs.
+
+The repository also includes a wrapper for the same strict check:
+
+```powershell
+.\scripts\cuda-live-migration-check.ps1 `
+  -Model .\models\qwen2.5-0.5b-instruct-gguf\qwen2.5-0.5b-instruct-q4_k_m.gguf `
+  -GpuLayers 12 `
+  -MinGpuDeltaMb 1
+```
+
+The wrapper requires `nvcc` on `PATH`, configures a CUDA build with `GGML_CUDA=ON`, builds `llama-live-migration-probe`, and fails unless the probe observes the required increase in free GPU memory.
+
 ## Runtime Use
 
 The patch exposes the migration primitive for explicit control:
