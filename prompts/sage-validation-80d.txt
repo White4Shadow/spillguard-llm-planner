@@ -1,0 +1,87 @@
+# Fresh SAGE validation set D.
+# Frozen proxy gate:
+#   proxy_entropy <= 0.6 OR proxy_margin >= 1.5
+# Frozen sparse verifier candidate classes:
+#   punct, capitalized
+# Frozen sparse verifier rule:
+#   proxy.entropy <= 0.040003470206379677 OR ffn_norm_0.sum >= -72.150276000000005
+When a patient has a fever and stiff neck, clinicians should
+The safest way to store insulin is
+If a medication causes dizziness, the patient should
+A randomized trial reduces bias by
+The purpose of informed consent is
+When blood pressure is very low, the first concern is
+If a lab result is outside range, the doctor should
+A vaccine booster helps by
+The main risk of dehydration is
+When antibiotics are overused, bacteria can
+If chest pain is severe, emergency care
+A family history can change
+The purpose of triage is
+When a wound becomes red and swollen, it may
+If an inhaler is not working, the patient should
+A clinical guideline should be updated when
+When inflation rises quickly, central banks may
+The purpose of a budget surplus is
+If a bond yield rises, its price usually
+A diversified portfolio reduces
+When a currency weakens, imports become
+The difference between revenue and profit is
+If unemployment falls sharply, wages may
+A tariff increases the price of
+The safest financial forecast should include
+When interest rates fall, borrowers often
+If a company issues more shares, ownership
+A balance sheet shows
+The purpose of an audit is
+When cash flow is negative, a business
+If a contract has ambiguous terms, courts
+A privacy policy should explain
+When evidence is hearsay, the judge may
+The purpose of due process is
+If a tenant misses rent, the landlord
+A patent protects
+When a law conflicts with a constitution, courts
+If a witness contradicts earlier testimony, lawyers
+The safest legal advice starts with
+A non-disclosure agreement is used to
+When a recipe says to simmer, the liquid should
+The safest way to thaw frozen poultry is
+If bread dough does not rise, yeast may
+A sharp knife is safer because
+When oil starts smoking, the heat is
+If rice is undercooked, add
+The purpose of resting meat is
+When baking powder expires, cakes may
+If soup is too salty, one fix is
+A balanced meal should include
+When a bridge carries heavy traffic, engineers check
+The purpose of a retaining wall is
+If a beam bends too much, it may
+A sensor calibration should be repeated when
+When a battery overheats, the device should
+If a motor draws too much current, the circuit
+A safety factor accounts for
+The purpose of a load test is
+When corrosion appears on steel, maintenance
+If a pipe freezes, pressure can
+A fault-tolerant design assumes
+When a student cites a source, the citation should
+The purpose of a thesis statement is
+If a paragraph lacks evidence, the writer should
+A peer review should focus on
+When a translation changes meaning, the editor
+If a survey question is leading, responses
+The purpose of an abstract is
+When a dataset has missing values, analysts should
+If a chart uses a truncated axis, readers
+A causal claim requires
+When a camera lens is wide open, depth of field
+The purpose of a tripod is
+If an image is overexposed, highlights
+A microphone placed too far away will
+When audio clips, the signal
+If a scene is backlit, the subject
+A storyboard helps plan
+When editing video, continuity means
+If the final mix is too loud, playback

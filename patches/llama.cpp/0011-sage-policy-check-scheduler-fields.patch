@@ -1,0 +1,72 @@
+diff --git a/examples/sage-policy-check/sage-policy-check.cpp b/examples/sage-policy-check/sage-policy-check.cpp
+index b44c7f0..c7b3d63 100644
+--- a/examples/sage-policy-check/sage-policy-check.cpp
++++ b/examples/sage-policy-check/sage-policy-check.cpp
+@@ -84,7 +84,56 @@ static json decision_to_json(const common_sage_policy_input & input, const commo
+     out["reason"] = result.reason;
+     return out;
+ }
+ 
++static bool json_has_string(const json & row, const char * key) {
++    return row.contains(key) && !row.at(key).is_null() && row.at(key).is_string();
++}
++
++static bool json_has_bool(const json & row, const char * key) {
++    return row.contains(key) && !row.at(key).is_null() && row.at(key).is_boolean();
++}
++
++static bool action_accepts_proxy(const common_sage_policy_result & result) {
++    return std::strcmp(result.action, "accept_proxy") == 0;
++}
++
++static void add_scheduler_fields(json & out, const json & row, const common_sage_policy_result & result) {
++    const bool has_proxy_token = json_has_string(row, "proxy_token");
++    const bool has_oracle_token = json_has_string(row, "oracle_token");
++
++    std::string proxy_token;
++    std::string oracle_token;
++    if (has_proxy_token) {
++        proxy_token = row.at("proxy_token").get<std::string>();
++        out["proxy_token"] = proxy_token;
++    }
++    if (has_oracle_token) {
++        oracle_token = row.at("oracle_token").get<std::string>();
++        out["oracle_token"] = oracle_token;
++    }
++    if (has_proxy_token && has_oracle_token) {
++        out["selected_token"] = action_accepts_proxy(result) ? proxy_token : oracle_token;
++    }
++
++    bool has_top1_match = false;
++    bool top1_match = false;
++    if (json_has_bool(row, "top1_match")) {
++        has_top1_match = true;
++        top1_match = row.at("top1_match").get<bool>();
++    } else if (json_has_bool(row, "replay_top1_token_match")) {
++        has_top1_match = true;
++        top1_match = row.at("replay_top1_token_match").get<bool>();
++    }
++
++    if (has_top1_match) {
++        out["top1_match"] = top1_match;
++        out["false_accept"] = action_accepts_proxy(result) && !top1_match;
++    } else if (has_proxy_token || has_oracle_token) {
++        out["top1_match"] = nullptr;
++        out["false_accept"] = nullptr;
++    }
++}
++
+ static void print_decision_json(const common_sage_policy_input & input, const common_sage_policy_result & result) {
+     std::printf("%s\n", decision_to_json(input, result).dump().c_str());
+ }
+@@ -136,7 +184,9 @@ static int run_jsonl(const std::string & input_path, const std::string & output_
+             const json row = json::parse(line);
+             const common_sage_policy_input policy_input = input_from_json(row);
+             const common_sage_policy_result result = common_sage_decide(policy_input);
+-            (*output) << decision_to_json(policy_input, result).dump() << '\n';
++            json output_row = decision_to_json(policy_input, result);
++            add_scheduler_fields(output_row, row, result);
++            (*output) << output_row.dump() << '\n';
+         } catch (const std::exception & e) {
+             std::fprintf(stderr, "failed to process JSONL line %zu: %s\n", line_number, e.what());
+             return 1;

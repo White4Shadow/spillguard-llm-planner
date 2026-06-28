@@ -1,0 +1,85 @@
+# Second fresh SAGE validation prompts.
+# Predeclared gate for this set:
+#   proxy_entropy <= 0.6 OR proxy_margin >= 1.5
+# Do not tune thresholds on this file.
+
+When a socket connection times out, the client should
+The purpose of exponential backoff is
+If a queue grows without bound, memory usage
+A rate limiter protects a service by
+An API gateway usually handles
+When a request is retried, idempotency
+The difference between authentication and authorization is
+If a JWT is not validated, an attacker
+Refresh tokens should be stored
+Password reset links should expire because
+In OAuth, the authorization code is exchanged for
+If CORS is misconfigured, browsers may
+A sandbox restricts code by
+Container isolation can fail when
+The Linux kernel schedules threads by
+If a process leaks file descriptors, eventually
+The purpose of a ring buffer is
+A bloom filter can answer
+If a cache key omits a parameter, users may
+Write-through caching differs from write-back because
+When a cache entry expires, the next request
+An LRU cache evicts
+The difference between row-store and column-store databases is
+An append-only log helps recovery by
+If a transaction rolls back, the database
+Snapshot isolation can still allow
+The purpose of a checksum is
+If a packet is corrupted in transit, TCP
+In a Merkle tree, each parent hash
+A consensus protocol needs a quorum because
+If a leader election repeats constantly, the cluster
+The main cost of sharding is
+In Python, asyncio tasks run on
+A context manager calls __exit__ when
+If a function mutates its default argument,
+A dataclass automatically generates
+In C, undefined behavior means
+Pointer arithmetic is dangerous when
+In Java, garbage collection frees
+In Go, a goroutine is
+A channel can deadlock when
+In TypeScript, a discriminated union uses
+React reconciliation compares
+If a component re-renders too often, performance
+CSS specificity decides
+An accessible button should
+If color is the only signal, accessibility
+The purpose of ARIA labels is
+A responsive layout should adapt when
+If an image lacks alt text, screen readers
+For a binary classifier, precision measures
+Recall is important when missing positives
+The F1 score combines
+If a dataset has label leakage, validation
+Cross-validation estimates
+A confusion matrix shows
+In reinforcement learning, reward hacking means
+If a model is overconfident, calibration
+Temperature scaling changes
+A safety classifier should avoid
+If training data contains secrets, the model
+Differential privacy protects
+Federated learning keeps data
+In attention, query and key vectors are used to
+The rotary embedding changes
+A causal mask ensures
+If context length doubles, attention cost
+Grouped-query attention reduces
+A Mixture-of-Experts router selects
+If an expert is overloaded, tokens
+KV cache reuse is invalid when
+Speculative decoding fails when
+A draft model should be much faster than
+If the verifier accepts too many bad drafts,
+The oracle fallback should preserve
+Active-byte scheduling decides
+If PCIe bandwidth is saturated, transfers
+A 100B model on a 12GB GPU requires
+The weakest assumption in SAGE is
+Before claiming success, the experiment must

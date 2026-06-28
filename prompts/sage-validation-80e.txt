@@ -1,0 +1,87 @@
+# Fresh SAGE validation set E.
+# Frozen proxy gate:
+#   proxy_entropy <= 0.6 OR proxy_margin >= 1.5
+# Frozen sparse verifier candidate classes:
+#   punct, capitalized
+# Frozen sparse verifier rule:
+#   proxy.entropy <= 0.040003470206379677 OR ffn_norm_0.sum >= -72.150276000000005
+When a newborn has trouble breathing, the care team should
+The first step after a suspected stroke is
+If a blood culture is contaminated, clinicians may
+A safe discharge plan includes
+When kidney function declines, medication doses
+The purpose of a placebo control is
+If a patient reports an allergy, the chart should
+A medication reconciliation prevents
+When oxygen saturation drops, nurses should
+The safest response to severe hypoglycemia is
+If inflation expectations rise, lenders may
+A company's gross margin measures
+When a startup burns cash quickly, investors watch
+The purpose of collateral is
+If a mortgage rate increases, monthly payments
+A credit rating estimates
+When supply falls and demand stays high, prices
+The safest retirement plan diversifies
+If a bank faces a run, regulators may
+An income statement summarizes
+When a lease expires, the parties can
+The purpose of discovery in litigation is
+If a contract lacks consideration, it may
+A trademark protects
+When police need a warrant, they must
+If a statute is vague, courts may
+A fiduciary duty requires
+When a company processes user data, consent
+The safest compliance review checks
+If a court grants an injunction, the defendant
+When caramel darkens too quickly, reduce
+The purpose of kneading dough is
+If a sauce separates, the cook can
+A thermometer confirms
+When vegetables are blanched, they are
+If a cake sinks in the center, it may
+The safest way to cool leftovers is
+When pasta water is salted, the flavor
+If a pan is overcrowded, food tends
+A marinade helps by
+When a database index is missing, queries
+The purpose of load balancing is
+If a server returns 500 errors, engineers
+A circuit breaker pattern prevents
+When memory leaks grow, the process
+If a deployment fails health checks, rollback
+The safest backup strategy includes
+When latency spikes, tracing can
+If a cache is stale, users may
+A schema migration should
+When groundwater is contaminated, testing should
+The purpose of a watershed is
+If a wildfire spreads quickly, evacuation
+A carbon sink absorbs
+When soil erodes, farmers can
+If a habitat is fragmented, species
+The safest flood plan identifies
+When a heat wave lasts days, cities
+If rainfall patterns shift, reservoirs
+A renewable grid still needs
+When a lesson starts, the teacher should
+The purpose of formative assessment is
+If a student plagiarizes, the instructor
+A rubric makes grading
+When feedback is specific, learners can
+If group work is unfair, roles
+The safest exam policy explains
+When a textbook is outdated, instructors
+If attendance drops, advisors may
+A lab notebook should record
+When a photograph has motion blur, shutter speed
+The purpose of white balance is
+If a podcast room echoes, add
+A lower camera angle can make
+When compression is too strong, video
+If color grading is inconsistent, scenes
+The safest drone shot checks
+When subtitles are mistimed, viewers
+If background music masks dialogue, reduce
+A call sheet tells

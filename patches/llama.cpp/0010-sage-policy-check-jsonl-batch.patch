@@ -1,0 +1,178 @@
+diff --git a/examples/sage-policy-check/sage-policy-check.cpp b/examples/sage-policy-check/sage-policy-check.cpp
+index 908f91a..b44c7f0 100644
+--- a/examples/sage-policy-check/sage-policy-check.cpp
++++ b/examples/sage-policy-check/sage-policy-check.cpp
+@@ -1,11 +1,17 @@
+ #include "sage.h"
++
++#include <nlohmann/json.hpp>
+ 
+ #include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <fstream>
++#include <iostream>
+ #include <string>
+ #include <vector>
++
++using json = nlohmann::ordered_json;
+ 
+ struct test_case {
+     const char * name;
+@@ -16,7 +22,8 @@
+ 
+ static void print_usage(const char * argv0) {
+     std::fprintf(stderr,
+-            "usage: %s [--self-test] [--candidate-id ID] --token-class CLASS "
++            "usage: %s [--self-test] [--jsonl-in PATH [--jsonl-out PATH]] "
++            "[--candidate-id ID] --token-class CLASS "
+             "--proxy-entropy N --proxy-margin N [--ffn-norm-0-sum N] "
+             "[--ffn-norm-0-sequence N] [--expect-action ACTION] [--expect-reason REASON]\n",
+             argv0);
+@@ -54,34 +61,88 @@
+     std::putchar('"');
+ }
+ 
++static json decision_to_json(const common_sage_policy_input & input, const common_sage_policy_result & result) {
++    json out;
++    out["candidate_id"] = input.candidate_id;
++    out["token_class"] = input.token_class;
++    out["proxy_entropy"] = input.proxy_entropy;
++    out["proxy_margin"] = input.proxy_margin;
++    out["proxy_gate_accept"] = result.proxy_gate_accept;
++    out["verifier_needed"] = result.verifier_needed;
++    out["verifier_covered"] = result.verifier_covered;
++    if (result.verifier_covered) {
++        out["verifier_accept"] = result.verifier_accept;
++    } else {
++        out["verifier_accept"] = nullptr;
++    }
++    out["ffn_norm_0_sequence"] = input.ffn_norm_0_sequence;
++    if (input.has_ffn_norm_0) {
++        out["ffn_norm_0_sum"] = input.ffn_norm_0_sum;
++    } else {
++        out["ffn_norm_0_sum"] = nullptr;
++    }
++    out["action"] = result.action;
++    out["reason"] = result.reason;
++    return out;
++}
++
+ static void print_decision_json(const common_sage_policy_input & input, const common_sage_policy_result & result) {
+-    std::printf("{\"candidate_id\":");
+-    print_json_string(input.candidate_id.c_str());
+-    std::printf(",\"token_class\":");
+-    print_json_string(input.token_class.c_str());
+-    std::printf(",\"proxy_entropy\":%.17g", input.proxy_entropy);
+-    std::printf(",\"proxy_margin\":%.17g", input.proxy_margin);
+-    std::printf(",\"proxy_gate_accept\":%s", result.proxy_gate_accept ? "true" : "false");
+-    std::printf(",\"verifier_needed\":%s", result.verifier_needed ? "true" : "false");
+-    std::printf(",\"verifier_covered\":%s", result.verifier_covered ? "true" : "false");
+-    std::printf(",\"verifier_accept\":");
+-    if (result.verifier_covered) {
+-        std::printf("%s", result.verifier_accept ? "true" : "false");
+-    } else {
+-        std::printf("null");
+-    }
+-    std::printf(",\"ffn_norm_0_sequence\":%lld", (long long) input.ffn_norm_0_sequence);
+-    std::printf(",\"ffn_norm_0_sum\":");
+-    if (input.has_ffn_norm_0) {
+-        std::printf("%.17g", input.ffn_norm_0_sum);
+-    } else {
+-        std::printf("null");
+-    }
+-    std::printf(",\"action\":");
+-    print_json_string(result.action);
+-    std::printf(",\"reason\":");
+-    print_json_string(result.reason);
+-    std::printf("}\n");
++    std::printf("%s\n", decision_to_json(input, result).dump().c_str());
++}
++
++static common_sage_policy_input input_from_json(const json & row) {
++    common_sage_policy_input input;
++    input.candidate_id = row.value("candidate_id", "");
++    input.token_class = row.at("token_class").get<std::string>();
++    input.proxy_entropy = row.at("proxy_entropy").get<double>();
++    input.proxy_margin = row.at("proxy_margin").get<double>();
++    if (row.contains("ffn_norm_0_sequence") && !row.at("ffn_norm_0_sequence").is_null()) {
++        input.ffn_norm_0_sequence = row.at("ffn_norm_0_sequence").get<int64_t>();
++    }
++    if (row.contains("ffn_norm_0_sum") && !row.at("ffn_norm_0_sum").is_null()) {
++        input.ffn_norm_0_sum = row.at("ffn_norm_0_sum").get<double>();
++        input.has_ffn_norm_0 = true;
++    }
++    return input;
++}
++
++static int run_jsonl(const std::string & input_path, const std::string & output_path) {
++    std::ifstream input(input_path);
++    if (!input.is_open()) {
++        std::fprintf(stderr, "failed to open --jsonl-in: %s\n", input_path.c_str());
++        return 1;
++    }
++
++    std::ofstream output_file;
++    std::ostream * output = &std::cout;
++    if (!output_path.empty() && output_path != "-") {
++        output_file.open(output_path, std::ios::out | std::ios::trunc);
++        if (!output_file.is_open()) {
++            std::fprintf(stderr, "failed to open --jsonl-out: %s\n", output_path.c_str());
++            return 1;
++        }
++        output = &output_file;
++    }
++
++    std::string line;
++    size_t line_number = 0;
++    while (std::getline(input, line)) {
++        line_number++;
++        if (line.empty()) {
++            continue;
++        }
++        try {
++            const json row = json::parse(line);
++            const common_sage_policy_input policy_input = input_from_json(row);
++            const common_sage_policy_result result = common_sage_decide(policy_input);
++            (*output) << decision_to_json(policy_input, result).dump() << '\n';
++        } catch (const std::exception & e) {
++            std::fprintf(stderr, "failed to process JSONL line %zu: %s\n", line_number, e.what());
++            return 1;
++        }
++    }
++    output->flush();
++    return 0;
+ }
+ 
+ static int run_self_test() {
+@@ -160,12 +221,18 @@
+     input.candidate_id = "manual";
+     const char * expect_action = nullptr;
+     const char * expect_reason = nullptr;
++    std::string jsonl_in;
++    std::string jsonl_out;
+     bool have_entropy = false;
+     bool have_margin = false;
+ 
+     for (int i = 1; i < argc; ++i) {
+         if (std::strcmp(argv[i], "--self-test") == 0) {
+             return run_self_test();
++        } else if (std::strcmp(argv[i], "--jsonl-in") == 0 && i + 1 < argc) {
++            jsonl_in = argv[++i];
++        } else if (std::strcmp(argv[i], "--jsonl-out") == 0 && i + 1 < argc) {
++            jsonl_out = argv[++i];
+         } else if (std::strcmp(argv[i], "--candidate-id") == 0 && i + 1 < argc) {
+             input.candidate_id = argv[++i];
+         } else if (std::strcmp(argv[i], "--token-class") == 0 && i + 1 < argc) {
+@@ -203,6 +270,10 @@
+         }
+     }
+ 
++    if (!jsonl_in.empty()) {
++        return run_jsonl(jsonl_in, jsonl_out);
++    }
++
+     if (input.token_class.empty() || !have_entropy || !have_margin) {
+         print_usage(argv[0]);
+         return 1;

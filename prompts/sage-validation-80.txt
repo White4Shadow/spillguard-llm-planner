@@ -1,0 +1,84 @@
+# Fresh SAGE validation prompts.
+# Use this after freezing a gate on sage-calibration-hard-120.txt.
+# Do not tune thresholds on this file.
+
+When a service returns HTTP 503, the client should
+In a priority queue, the next item removed is
+The main drawback of recursive algorithms is
+If a heap allocation fails, robust software
+The difference between latency and throughput is
+In a neural network, dropout helps by
+The Adam optimizer keeps estimates of
+If gradients explode during training, one fix is
+A tokenizer vocabulary determines
+When two tokens share a prefix, decoding
+The purpose of a system prompt is
+If a model hallucinates a citation, the answer
+Retrieval augmented generation helps when
+A reranker is useful because
+Embedding vectors compare text by
+Cosine similarity ranges from
+If a vector database returns irrelevant chunks, then
+The main risk of long context is
+When a KV cache grows, memory use
+If KV pages are evicted too early, the model
+A quantization scale maps
+Per-channel quantization is often better because
+If outlier weights are clipped, accuracy
+Activation-aware quantization uses
+The reason 2-bit weights are difficult is
+In MoE models, only some experts
+Expert routing can fail when
+A load-balanced router should
+If all experts are loaded from disk every token,
+Speculative decoding saves time when
+The verifier in speculative decoding must
+If a draft proposes eight tokens, the target model
+A rejection in speculative decoding means
+Self-speculative decoding uses
+An early-exit layer can be trusted only if
+A confidence threshold should be calibrated on
+If the acceptance threshold is too low, quality
+If the acceptance threshold is too high, speed
+An oracle fallback should handle
+A sparse oracle block should be selected by
+When a tensor is copied over PCIe, the cost
+Pinned host memory helps transfers by
+CUDA streams can overlap
+Double buffering is useful when
+If transfer time exceeds compute time, the GPU
+The active-byte budget is calculated from
+If a layer is migrated while a graph uses it,
+A safe migration point is
+The purpose of a backend buffer is
+Fragmented VRAM can cause
+If system RAM is only 32 GB, a 100B model
+NVMe bandwidth is usually measured in
+Random disk reads are slower than
+A page cache can hide disk latency when
+If Windows starts paging model weights, inference
+The most important benchmark for chat is
+Tokens per second can be misleading when
+Prompt processing speed matters because
+Decode speed dominates when
+If a server batches many users, latency
+On a single-user desktop, batching
+The difference between exact and approximate inference is
+A research prototype should report
+An ablation should remove
+A held-out set prevents
+If a rule only works on calibration prompts, it
+The SAGE proxy gate accepts a token when
+The SAGE oracle should run when
+The SAGE sparse verifier is useful if
+The current strongest SAGE evidence is
+The weakest part of the SAGE design is
+If the proxy and oracle tokenize differently, then
+Using the same tokenizer matters because
+A bad capitalized token can change
+A punctuation token can be unsafe when
+Whitespace is usually safe unless
+Numeric output needs special care because
+In code generation, a single character can
+For math prompts, the oracle should
+For security prompts, approximation is risky because

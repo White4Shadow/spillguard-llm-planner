@@ -1,0 +1,20 @@
+diff --git a/examples/debug/debug.cpp b/examples/debug/debug.cpp
+--- a/examples/debug/debug.cpp
++++ b/examples/debug/debug.cpp
+@@ -227,7 +227,14 @@ int main(int argc, char ** argv) {
+     llama_backend_init();
+     llama_numa_init(params.numa);
+-
++
++    const bool enable_debug_cb =
++        !params.save_logits ||
++        !params.tensor_filter.empty() ||
++        params.tensor_stats ||
++        !params.tensor_stats_output.empty() ||
++        !params.tensor_values_output.empty();
++
+     std::optional<common_debug_cb_user_data> cb_data;
+-    if (!params.save_logits) {
++    if (enable_debug_cb) {
+         cb_data.emplace(params, params.tensor_filter);
+     }

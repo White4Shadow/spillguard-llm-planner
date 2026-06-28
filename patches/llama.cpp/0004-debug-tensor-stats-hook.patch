@@ -1,0 +1,170 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 841a38e9..224b9fa8 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -4027,6 +4027,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.tensor_filter.push_back(value);
+         }
+     ).set_examples({LLAMA_EXAMPLE_DEBUG}));
++    add_opt(common_arg(
++        {"--tensor-stats"},
++        string_format("print compact tensor statistics instead of tensor values (default: %s)", params.tensor_stats ? "true" : "false"),
++        [](common_params & params) {
++            params.tensor_stats = true;
++        }
++    ).set_examples({LLAMA_EXAMPLE_DEBUG}));
+ 
+     // presets
+     add_opt(common_arg(
+diff --git a/common/common.h b/common/common.h
+index 94147d5d..ab839ac9 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -508,6 +508,7 @@ struct common_params {
+     // llama-debug specific options
+     std::string logits_output_dir = "data"; // directory for saving logits output files                     // NOLINT
+     bool        save_logits       = false;  // whether to save logits to files                              // NOLINT
++    bool        tensor_stats      = false;  // print compact tensor statistics instead of tensor values      // NOLINT
+     std::vector<std::string> tensor_filter; // filter tensor names for debug output (regex)                 // NOLINT
+ 
+     std::vector<std::string> in_files;   // all input files
+diff --git a/common/debug.cpp b/common/debug.cpp
+index 434acb3a..2f7ae5e2 100644
+--- a/common/debug.cpp
++++ b/common/debug.cpp
+@@ -11,6 +11,7 @@
+ struct common_debug_cb_user_data::impl {
+     std::vector<uint8_t>    data;
+     std::vector<std::regex> tensor_filters;
++    bool                    tensor_stats{false};
+     bool                    abort_on_nan{false};
+ };
+ 
+@@ -28,6 +29,7 @@ common_debug_cb_user_data::common_debug_cb_user_data(common_params & params, con
+             throw std::runtime_error("Invalid regex pattern '" + pattern + "': " + e.what());
+         }
+     }
++    pimpl->tensor_stats = params.tensor_stats;
+     pimpl->abort_on_nan = abort_on_nan;
+ 
+     params.cb_eval           = common_debug_cb_eval;
+@@ -76,54 +78,82 @@ static float common_ggml_get_float_value(const uint8_t * data,
+ 
+ #define INDENT "    "
+ 
+-static void common_debug_print_tensor(uint8_t * data, ggml_type type, const int64_t * ne, const size_t * nb, int64_t n, bool abort_on_nan) {
++static void common_debug_print_tensor(
++        uint8_t *       data,
++        ggml_type       type,
++        const int64_t * ne,
++        const size_t *  nb,
++        int64_t         n,
++        bool            abort_on_nan,
++        bool            tensor_stats) {
+     GGML_ASSERT(n > 0);
+-    float sum = 0;
++    double  sum = 0.0;
++    float   min_val = 0.0f;
++    float   max_val = 0.0f;
++    int64_t n_values = 0;
++    int64_t n_nan = 0;
+     for (int64_t i3 = 0; i3 < ne[3]; i3++) {
+         for (int64_t i2 = 0; i2 < ne[2]; i2++) {
+             for (int64_t i1 = 0; i1 < ne[1]; i1++) {
+                 for (int64_t i0 = 0; i0 < ne[0]; i0++) {
+                     const float v = common_ggml_get_float_value(data, type, nb, i0, i1, i2, i3);
++                    if (n_values == 0 || v < min_val) {
++                        min_val = v;
++                    }
++                    if (n_values == 0 || v > max_val) {
++                        max_val = v;
++                    }
++                    if (std::isnan(v)) {
++                        n_nan++;
++                    }
+                     sum += v;
++                    n_values++;
+                 }
+             }
+         }
+     }
+-    for (int64_t i3 = 0; i3 < ne[3]; i3++) {
+-        LOG(INDENT "[\n");
+-        for (int64_t i2 = 0; i2 < ne[2]; i2++) {
+-            if (i2 == n && ne[2] > 2 * n) {
+-                LOG(INDENT INDENT "..., \n");
+-                i2 = ne[2] - n;
+-            }
+-            LOG(INDENT INDENT "[\n");
+-            for (int64_t i1 = 0; i1 < ne[1]; i1++) {
+-                if (i1 == n && ne[1] > 2 * n) {
+-                    LOG(INDENT INDENT INDENT "..., \n");
+-                    i1 = ne[1] - n;
++
++    if (tensor_stats) {
++        const double mean = n_values > 0 ? sum / double(n_values) : 0.0;
++        LOG(INDENT "stats: count = %lld, sum = %.9g, mean = %.9g, min = %.9g, max = %.9g, nan_count = %lld\n",
++            (long long) n_values, sum, mean, (double) min_val, (double) max_val, (long long) n_nan);
++    } else {
++        for (int64_t i3 = 0; i3 < ne[3]; i3++) {
++            LOG(INDENT "[\n");
++            for (int64_t i2 = 0; i2 < ne[2]; i2++) {
++                if (i2 == n && ne[2] > 2 * n) {
++                    LOG(INDENT INDENT "..., \n");
++                    i2 = ne[2] - n;
+                 }
+-                LOG(INDENT INDENT INDENT "[");
+-                for (int64_t i0 = 0; i0 < ne[0]; i0++) {
+-                    if (i0 == n && ne[0] > 2 * n) {
+-                        LOG("   ..., ");
+-                        i0 = ne[0] - n;
++                LOG(INDENT INDENT "[\n");
++                for (int64_t i1 = 0; i1 < ne[1]; i1++) {
++                    if (i1 == n && ne[1] > 2 * n) {
++                        LOG(INDENT INDENT INDENT "..., \n");
++                        i1 = ne[1] - n;
+                     }
+-                    const float v = common_ggml_get_float_value(data, type, nb, i0, i1, i2, i3);
+-                    LOG("%12.4f", v);
+-                    if (i0 < ne[0] - 1) {
+-                        LOG(", ");
++                    LOG(INDENT INDENT INDENT "[");
++                    for (int64_t i0 = 0; i0 < ne[0]; i0++) {
++                        if (i0 == n && ne[0] > 2 * n) {
++                            LOG("   ..., ");
++                            i0 = ne[0] - n;
++                        }
++                        const float v = common_ggml_get_float_value(data, type, nb, i0, i1, i2, i3);
++                        LOG("%12.4f", v);
++                        if (i0 < ne[0] - 1) {
++                            LOG(", ");
++                        }
+                     }
++                    LOG("  ],\n");
+                 }
+-                LOG("  ],\n");
++                LOG(INDENT INDENT "],\n");
+             }
+-            LOG(INDENT INDENT "],\n");
++            LOG(INDENT "]\n");
++            LOG(INDENT "sum = %f\n", sum);
+         }
+-        LOG(INDENT "]\n");
+-        LOG(INDENT "sum = %f\n", sum);
+     }
+ 
+     if (abort_on_nan) {
+-        if (std::isnan(sum)) {
++        if (n_nan > 0 || std::isnan(sum)) {
+             LOG("encountered NaN - aborting\n");
+             exit(0);
+         }
+@@ -183,7 +213,7 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
+ 
+     if (!ggml_is_quantized(t->type) && matches_filter) {
+         uint8_t * data = is_host ? (uint8_t *) t->data : pimpl->data.data();
+-        common_debug_print_tensor(data, t->type, t->ne, t->nb, 3, pimpl->abort_on_nan);
++        common_debug_print_tensor(data, t->type, t->ne, t->nb, 3, pimpl->abort_on_nan, pimpl->tensor_stats);
+     }
+ 
+     return true;

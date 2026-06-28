@@ -1,0 +1,855 @@
+diff --git a/examples/CMakeLists.txt b/examples/CMakeLists.txt
+index f32e5a10..a61e9b20 100644
+--- a/examples/CMakeLists.txt
++++ b/examples/CMakeLists.txt
+@@ -30,5 +30,6 @@ else()
+     add_subdirectory(passkey)
+     add_subdirectory(retrieval)
++    add_subdirectory(sage-dual-live)
+     add_subdirectory(sage-policy-check)
+     add_subdirectory(sage-proxy-live)
+     add_subdirectory(sage-scheduler-replay)
+diff --git a/examples/sage-dual-live/CMakeLists.txt b/examples/sage-dual-live/CMakeLists.txt
+new file mode 100644
+index 00000000..4fceae01
+--- /dev/null
++++ b/examples/sage-dual-live/CMakeLists.txt
+@@ -0,0 +1,5 @@
++set(TARGET llama-sage-dual-live)
++add_executable(${TARGET} sage-dual-live.cpp)
++install(TARGETS ${TARGET} RUNTIME)
++target_link_libraries(${TARGET} PRIVATE llama-common llama ${CMAKE_THREAD_LIBS_INIT})
++target_compile_features(${TARGET} PRIVATE cxx_std_17)
+diff --git a/examples/sage-dual-live/sage-dual-live.cpp b/examples/sage-dual-live/sage-dual-live.cpp
+new file mode 100644
+index 00000000..a69ec550
+--- /dev/null
++++ b/examples/sage-dual-live/sage-dual-live.cpp
+@@ -0,0 +1,827 @@
++#include "sage.h"
++#include "llama.h"
++
++#include <nlohmann/json.hpp>
++
++#include <algorithm>
++#include <chrono>
++#include <cstdint>
++#include <clocale>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cctype>
++#include <cstring>
++#include <fstream>
++#include <limits>
++#include <memory>
++#include <string>
++#include <vector>
++
++using json = nlohmann::ordered_json;
++
++struct dual_params {
++    std::string proxy_model;
++    std::string oracle_model;
++    std::string prompt = "The capital of France is";
++    std::string json_out;
++    int proxy_ngl = 99;
++    int oracle_ngl = 99;
++    int n_predict = 16;
++    int n_ctx = 0;
++    int kv_hot_recent_tokens = 512;
++    int kv_sink_tokens = 16;
++    int kv_warm_max_tokens = 3584;
++    int kv_warm_bits = 2;
++    int kv_cold_summary_dim = 256;
++    int kv_cold_summary_bits = 8;
++    int logit_top_k = 10;
++};
++
++struct token_score {
++    llama_token id = LLAMA_TOKEN_NULL;
++    double logit = -std::numeric_limits<double>::infinity();
++};
++
++struct logit_stats {
++    llama_token top1_id = LLAMA_TOKEN_NULL;
++    llama_token top2_id = LLAMA_TOKEN_NULL;
++    double top1_logit = -std::numeric_limits<double>::infinity();
++    double top2_logit = -std::numeric_limits<double>::infinity();
++    double margin = 0.0;
++    double entropy = 0.0;
++    std::vector<token_score> top;
++};
++
++struct generated_token {
++    bool ok = false;
++    bool eog = false;
++    llama_token id = LLAMA_TOKEN_NULL;
++    std::string piece;
++    std::string cls;
++    logit_stats stats;
++    int position = 0;
++};
++
++struct live_runner {
++    std::string name;
++    std::string model_path;
++    llama_model * model = nullptr;
++    llama_context * ctx = nullptr;
++    llama_sampler * sampler = nullptr;
++    const llama_vocab * vocab = nullptr;
++    std::vector<llama_token> pending;
++    int n_pos = 0;
++    int n_vocab = 0;
++    int decode_calls = 0;
++    int accepted_text_tokens = 0;
++    uint64_t model_size_bytes = 0;
++    uint64_t n_params = 0;
++    int n_layer = 0;
++    int n_embd = 0;
++    int n_head = 0;
++    int n_head_kv = 0;
++    uint64_t kv_bytes_per_token_estimate = 0;
++};
++
++struct step_timing {
++    double proxy_decode_ms = 0.0;
++    double oracle_decode_ms = 0.0;
++    double total_step_ms = 0.0;
++};
++
++struct kv_tier_account {
++    int tokens = 0;
++    int sink_tokens = 0;
++    int recent_tokens = 0;
++    int hot_tokens = 0;
++    int warm_tokens = 0;
++    int cold_tokens = 0;
++    uint64_t full_precision_bytes = 0;
++    uint64_t hot_kv_bytes = 0;
++    uint64_t warm_kv_bytes = 0;
++    uint64_t cold_kv_bytes = 0;
++    uint64_t tier_total_bytes = 0;
++    uint64_t saved_bytes_vs_full_precision = 0;
++    double saved_percent_vs_full_precision = 0.0;
++};
++
++static void print_usage(const char * argv0) {
++    std::fprintf(stderr,
++            "usage: %s [--self-test] --proxy-model proxy.gguf [--oracle-model oracle.gguf] "
++            "[-ngl n] [--proxy-ngl n] [--oracle-ngl n] [-n tokens] [-c ctx] "
++            "[--kv-hot-recent N] [--kv-sink N] [--kv-warm-max N] [--kv-warm-bits N] "
++            "[--logit-top-k N] "
++            "[--json-out PATH] [prompt]\n",
++            argv0);
++}
++
++static bool parse_int(const char * raw, int & out) {
++    char * end = nullptr;
++    long value = std::strtol(raw, &end, 10);
++    if (end == raw || end == nullptr || *end != '\0') {
++        return false;
++    }
++    out = (int) value;
++    return true;
++}
++
++static double elapsed_ms(const std::chrono::steady_clock::time_point & begin, const std::chrono::steady_clock::time_point & end) {
++    return std::chrono::duration<double, std::milli>(end - begin).count();
++}
++
++static double percent_of(uint64_t part, uint64_t total) {
++    return total > 0 ? 100.0 * (double) part / (double) total : 0.0;
++}
++
++static uint64_t estimate_f16_kv_bytes_per_token(int n_layer, int n_embd, int n_head, int n_head_kv) {
++    if (n_layer <= 0 || n_embd <= 0 || n_head <= 0 || n_head_kv <= 0) {
++        return 0;
++    }
++    const uint64_t kv_dim = ((uint64_t) n_embd * (uint64_t) n_head_kv + (uint64_t) n_head - 1) / (uint64_t) n_head;
++    return (uint64_t) n_layer * kv_dim * 2u * sizeof(uint16_t);
++}
++
++static uint64_t round_to_u64(double value) {
++    if (value <= 0.0 || !std::isfinite(value)) {
++        return 0;
++    }
++    if (value >= (double) std::numeric_limits<uint64_t>::max()) {
++        return std::numeric_limits<uint64_t>::max();
++    }
++    return (uint64_t) std::llround(value);
++}
++
++static kv_tier_account estimate_tiered_kv_bytes(int token_count, uint64_t full_bytes_per_token, const dual_params & params) {
++    kv_tier_account out;
++    out.tokens = std::max(token_count, 0);
++    out.sink_tokens = std::min(out.tokens, std::max(params.kv_sink_tokens, 0));
++    const int remaining_after_sink = std::max(out.tokens - out.sink_tokens, 0);
++    out.recent_tokens = std::min(remaining_after_sink, std::max(params.kv_hot_recent_tokens, 0));
++    out.warm_tokens = std::min(
++            std::max(remaining_after_sink - out.recent_tokens, 0),
++            std::max(params.kv_warm_max_tokens, 0));
++    out.cold_tokens = std::max(remaining_after_sink - out.recent_tokens - out.warm_tokens, 0);
++    out.hot_tokens = out.sink_tokens + out.recent_tokens;
++
++    const double warm_bytes_per_token =
++            (double) full_bytes_per_token * (double) std::max(params.kv_warm_bits, 1) / 16.0;
++    const double cold_bytes_per_token =
++            (double) std::max(params.kv_cold_summary_dim, 0) *
++            (double) std::max(params.kv_cold_summary_bits, 1) / 8.0;
++    out.full_precision_bytes = round_to_u64((double) out.tokens * (double) full_bytes_per_token);
++    out.hot_kv_bytes = round_to_u64((double) out.hot_tokens * (double) full_bytes_per_token);
++    out.warm_kv_bytes = round_to_u64((double) out.warm_tokens * warm_bytes_per_token);
++    out.cold_kv_bytes = round_to_u64((double) out.cold_tokens * cold_bytes_per_token);
++    out.tier_total_bytes = out.hot_kv_bytes + out.warm_kv_bytes + out.cold_kv_bytes;
++    out.saved_bytes_vs_full_precision = out.full_precision_bytes > out.tier_total_bytes
++            ? out.full_precision_bytes - out.tier_total_bytes
++            : 0;
++    out.saved_percent_vs_full_precision = out.full_precision_bytes > 0
++            ? 100.0 * (double) out.saved_bytes_vs_full_precision / (double) out.full_precision_bytes
++            : 0.0;
++    return out;
++}
++
++static std::string token_to_piece(const llama_vocab * vocab, llama_token token) {
++    std::string piece;
++    piece.resize(piece.capacity());
++    int n_chars = llama_token_to_piece(vocab, token, &piece[0], piece.size(), 0, true);
++    if (n_chars < 0) {
++        piece.resize(-n_chars);
++        n_chars = llama_token_to_piece(vocab, token, &piece[0], piece.size(), 0, true);
++        if (n_chars < 0) {
++            return "";
++        }
++    }
++    piece.resize(n_chars);
++    return piece;
++}
++
++static std::string trim_ascii(const std::string & text) {
++    size_t begin = 0;
++    while (begin < text.size() && std::isspace((unsigned char) text[begin])) {
++        begin++;
++    }
++    size_t end = text.size();
++    while (end > begin && std::isspace((unsigned char) text[end - 1])) {
++        end--;
++    }
++    return text.substr(begin, end - begin);
++}
++
++static std::string token_class(const std::string & token) {
++    const std::string stripped = trim_ascii(token);
++    if (stripped.empty()) {
++        return "whitespace";
++    }
++    if (stripped.size() >= 4 && stripped.rfind("<|", 0) == 0 && stripped.substr(stripped.size() - 2) == "|>") {
++        return "control";
++    }
++
++    bool all_punct = true;
++    bool all_digit = true;
++    for (unsigned char c : stripped) {
++        all_punct = all_punct && !std::isalnum(c);
++        all_digit = all_digit && std::isdigit(c);
++    }
++    if (all_punct) {
++        return "punct";
++    }
++    if (all_digit) {
++        return "number";
++    }
++    if (!stripped.empty() && std::isupper((unsigned char) stripped[0])) {
++        return "capitalized";
++    }
++    return "word";
++}
++
++static void insert_top_score(std::vector<token_score> & top, int max_top_k, llama_token id, double logit) {
++    if (max_top_k <= 0) {
++        return;
++    }
++    token_score score;
++    score.id = id;
++    score.logit = logit;
++    auto it = std::find_if(top.begin(), top.end(), [&](const token_score & item) {
++        return logit > item.logit;
++    });
++    top.insert(it, score);
++    if ((int) top.size() > max_top_k) {
++        top.resize(max_top_k);
++    }
++}
++
++static logit_stats compute_logit_stats(const float * logits, int n_vocab, int max_top_k) {
++    logit_stats stats;
++    double max_logit = -std::numeric_limits<double>::infinity();
++    const int top_k = std::max(max_top_k, 0);
++    stats.top.reserve((size_t) top_k);
++    for (int i = 0; i < n_vocab; ++i) {
++        const double value = logits[i];
++        if (value > stats.top1_logit) {
++            stats.top2_logit = stats.top1_logit;
++            stats.top2_id = stats.top1_id;
++            stats.top1_logit = value;
++            stats.top1_id = i;
++        } else if (value > stats.top2_logit) {
++            stats.top2_logit = value;
++            stats.top2_id = i;
++        }
++        insert_top_score(stats.top, top_k, (llama_token) i, value);
++        max_logit = std::max(max_logit, value);
++    }
++
++    double sum_exp = 0.0;
++    double weighted = 0.0;
++    for (int i = 0; i < n_vocab; ++i) {
++        const double shifted = (double) logits[i] - max_logit;
++        const double exp_value = std::exp(shifted);
++        sum_exp += exp_value;
++        weighted += exp_value * shifted;
++    }
++    if (sum_exp > 0.0) {
++        stats.entropy = std::log(sum_exp) - weighted / sum_exp;
++    }
++    stats.margin = stats.top1_logit - stats.top2_logit;
++    return stats;
++}
++
++static std::vector<llama_token> tokenize_text(const llama_vocab * vocab, const std::string & text, bool add_special) {
++    const int n_tokens = -llama_tokenize(vocab, text.c_str(), text.size(), nullptr, 0, add_special, true);
++    if (n_tokens <= 0) {
++        return {};
++    }
++    std::vector<llama_token> tokens(n_tokens);
++    if (llama_tokenize(vocab, text.c_str(), text.size(), tokens.data(), tokens.size(), add_special, true) < 0) {
++        return {};
++    }
++    return tokens;
++}
++
++static bool parse_args(int argc, char ** argv, dual_params & params) {
++    int i = 1;
++    for (; i < argc; ++i) {
++        if (std::strcmp(argv[i], "--proxy-model") == 0 && i + 1 < argc) {
++            params.proxy_model = argv[++i];
++        } else if ((std::strcmp(argv[i], "--oracle-model") == 0 || std::strcmp(argv[i], "-m") == 0) && i + 1 < argc) {
++            params.oracle_model = argv[++i];
++        } else if (std::strcmp(argv[i], "-ngl") == 0 && i + 1 < argc) {
++            int value = 0;
++            if (!parse_int(argv[++i], value)) {
++                return false;
++            }
++            params.proxy_ngl = value;
++            params.oracle_ngl = value;
++        } else if (std::strcmp(argv[i], "--proxy-ngl") == 0 && i + 1 < argc) {
++            if (!parse_int(argv[++i], params.proxy_ngl)) {
++                return false;
++            }
++        } else if (std::strcmp(argv[i], "--oracle-ngl") == 0 && i + 1 < argc) {
++            if (!parse_int(argv[++i], params.oracle_ngl)) {
++                return false;
++            }
++        } else if (std::strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
++            if (!parse_int(argv[++i], params.n_predict)) {
++                return false;
++            }
++        } else if (std::strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
++            if (!parse_int(argv[++i], params.n_ctx)) {
++                return false;
++            }
++        } else if (std::strcmp(argv[i], "--kv-hot-recent") == 0 && i + 1 < argc) {
++            if (!parse_int(argv[++i], params.kv_hot_recent_tokens)) {
++                return false;
++            }
++        } else if (std::strcmp(argv[i], "--kv-sink") == 0 && i + 1 < argc) {
++            if (!parse_int(argv[++i], params.kv_sink_tokens)) {
++                return false;
++            }
++        } else if (std::strcmp(argv[i], "--kv-warm-max") == 0 && i + 1 < argc) {
++            if (!parse_int(argv[++i], params.kv_warm_max_tokens)) {
++                return false;
++            }
++        } else if (std::strcmp(argv[i], "--kv-warm-bits") == 0 && i + 1 < argc) {
++            if (!parse_int(argv[++i], params.kv_warm_bits)) {
++                return false;
++            }
++        } else if (std::strcmp(argv[i], "--kv-cold-summary-dim") == 0 && i + 1 < argc) {
++            if (!parse_int(argv[++i], params.kv_cold_summary_dim)) {
++                return false;
++            }
++        } else if (std::strcmp(argv[i], "--kv-cold-summary-bits") == 0 && i + 1 < argc) {
++            if (!parse_int(argv[++i], params.kv_cold_summary_bits)) {
++                return false;
++            }
++        } else if (std::strcmp(argv[i], "--logit-top-k") == 0 && i + 1 < argc) {
++            if (!parse_int(argv[++i], params.logit_top_k)) {
++                return false;
++            }
++        } else if (std::strcmp(argv[i], "--json-out") == 0 && i + 1 < argc) {
++            params.json_out = argv[++i];
++        } else {
++            break;
++        }
++    }
++
++    if (i < argc) {
++        params.prompt = argv[i++];
++        for (; i < argc; ++i) {
++            params.prompt += " ";
++            params.prompt += argv[i];
++        }
++    }
++    if (params.oracle_model.empty()) {
++        params.oracle_model = params.proxy_model;
++    }
++    return !params.proxy_model.empty() &&
++            !params.oracle_model.empty() &&
++            params.n_predict >= 0 &&
++            params.kv_hot_recent_tokens >= 0 &&
++            params.kv_sink_tokens >= 0 &&
++            params.kv_warm_max_tokens >= 0 &&
++            params.kv_warm_bits > 0 &&
++            params.kv_cold_summary_dim >= 0 &&
++            params.kv_cold_summary_bits > 0 &&
++            params.logit_top_k >= 0;
++}
++
++static bool init_runner(
++        live_runner &       runner,
++        const std::string & name,
++        const std::string & model_path,
++        const std::string & prompt,
++        int                 n_gpu_layers,
++        int                 n_ctx,
++        int                 n_predict) {
++    runner.name = name;
++    runner.model_path = model_path;
++
++    llama_model_params model_params = llama_model_default_params();
++    model_params.n_gpu_layers = n_gpu_layers;
++    runner.model = llama_model_load_from_file(model_path.c_str(), model_params);
++    if (runner.model == nullptr) {
++        std::fprintf(stderr, "sage-dual-live: failed to load %s model\n", name.c_str());
++        return false;
++    }
++
++    runner.vocab = llama_model_get_vocab(runner.model);
++    runner.model_size_bytes = llama_model_size(runner.model);
++    runner.n_params = llama_model_n_params(runner.model);
++    runner.n_layer = llama_model_n_layer(runner.model);
++    runner.n_embd = llama_model_n_embd(runner.model);
++    runner.n_head = llama_model_n_head(runner.model);
++    runner.n_head_kv = llama_model_n_head_kv(runner.model);
++    runner.kv_bytes_per_token_estimate = estimate_f16_kv_bytes_per_token(
++            runner.n_layer, runner.n_embd, runner.n_head, runner.n_head_kv);
++    runner.pending = tokenize_text(runner.vocab, prompt, true);
++    if (runner.pending.empty()) {
++        std::fprintf(stderr, "sage-dual-live: failed to tokenize %s prompt\n", name.c_str());
++        return false;
++    }
++
++    llama_context_params ctx_params = llama_context_default_params();
++    ctx_params.n_ctx = n_ctx > 0 ? n_ctx : std::max((int) runner.pending.size() + n_predict + 32, 64);
++    ctx_params.n_batch = ctx_params.n_ctx;
++    ctx_params.no_perf = false;
++    runner.ctx = llama_init_from_model(runner.model, ctx_params);
++    if (runner.ctx == nullptr) {
++        std::fprintf(stderr, "sage-dual-live: failed to create %s context\n", name.c_str());
++        return false;
++    }
++
++    auto sparams = llama_sampler_chain_default_params();
++    sparams.no_perf = false;
++    runner.sampler = llama_sampler_chain_init(sparams);
++    llama_sampler_chain_add(runner.sampler, llama_sampler_init_greedy());
++    runner.n_vocab = llama_vocab_n_tokens(runner.vocab);
++    return true;
++}
++
++static void free_runner(live_runner & runner) {
++    if (runner.sampler != nullptr) {
++        llama_sampler_free(runner.sampler);
++        runner.sampler = nullptr;
++    }
++    if (runner.ctx != nullptr) {
++        llama_free(runner.ctx);
++        runner.ctx = nullptr;
++    }
++    if (runner.model != nullptr) {
++        llama_model_free(runner.model);
++        runner.model = nullptr;
++    }
++}
++
++static generated_token generate_one(live_runner & runner, int logit_top_k) {
++    generated_token out;
++    if (runner.pending.empty()) {
++        std::fprintf(stderr, "sage-dual-live: %s has no pending tokens to decode\n", runner.name.c_str());
++        return out;
++    }
++
++    llama_batch batch = llama_batch_get_one(runner.pending.data(), runner.pending.size());
++    if (llama_model_has_encoder(runner.model)) {
++        if (llama_encode(runner.ctx, batch)) {
++            std::fprintf(stderr, "sage-dual-live: %s encoder eval failed\n", runner.name.c_str());
++            return out;
++        }
++        llama_token decoder_start = llama_model_decoder_start_token(runner.model);
++        if (decoder_start == LLAMA_TOKEN_NULL) {
++            decoder_start = llama_vocab_bos(runner.vocab);
++        }
++        batch = llama_batch_get_one(&decoder_start, 1);
++    }
++
++    if (llama_decode(runner.ctx, batch)) {
++        std::fprintf(stderr, "sage-dual-live: %s decode failed\n", runner.name.c_str());
++        return out;
++    }
++    runner.n_pos += batch.n_tokens;
++    runner.decode_calls++;
++    runner.pending.clear();
++
++    const float * logits = llama_get_logits_ith(runner.ctx, -1);
++    if (logits == nullptr) {
++        std::fprintf(stderr, "sage-dual-live: %s logits unavailable\n", runner.name.c_str());
++        return out;
++    }
++
++    out.stats = compute_logit_stats(logits, runner.n_vocab, logit_top_k);
++    out.id = llama_sampler_sample(runner.sampler, runner.ctx, -1);
++    if (llama_vocab_is_eog(runner.vocab, out.id)) {
++        out.eog = true;
++        out.ok = true;
++        return out;
++    }
++    out.piece = token_to_piece(runner.vocab, out.id);
++    out.cls = token_class(out.piece);
++    out.position = runner.n_pos;
++    out.ok = true;
++    return out;
++}
++
++static bool append_selected(live_runner & runner, const std::string & selected_text, llama_token native_token_id) {
++    if (native_token_id != LLAMA_TOKEN_NULL) {
++        runner.pending.push_back(native_token_id);
++        runner.accepted_text_tokens += 1;
++        return true;
++    }
++
++    std::vector<llama_token> tokens = tokenize_text(runner.vocab, selected_text, false);
++    if (tokens.empty() && !selected_text.empty()) {
++        std::fprintf(stderr, "sage-dual-live: failed to retokenize selected text for %s\n", runner.name.c_str());
++        return false;
++    }
++    runner.accepted_text_tokens += (int) tokens.size();
++    runner.pending.insert(runner.pending.end(), tokens.begin(), tokens.end());
++    return true;
++}
++
++static json token_json(const generated_token & token) {
++    if (!token.ok || token.eog) {
++        return nullptr;
++    }
++    json out;
++    out["token_id"] = token.id;
++    out["token"] = token.piece;
++    out["token_class"] = token.cls;
++    out["position"] = token.position;
++    out["entropy"] = token.stats.entropy;
++    out["margin"] = token.stats.margin;
++    out["logit_top1_id"] = token.stats.top1_id;
++    out["logit_top2_id"] = token.stats.top2_id;
++    out["logit_top1"] = token.stats.top1_logit;
++    out["logit_top2"] = token.stats.top2_logit;
++    out["sampled_is_logit_top1"] = token.id == token.stats.top1_id;
++    json top_ids = json::array();
++    json top_logits = json::array();
++    for (const token_score & score : token.stats.top) {
++        top_ids.push_back(score.id);
++        top_logits.push_back(score.logit);
++    }
++    out["logit_top_ids"] = top_ids;
++    out["logit_top_logits"] = top_logits;
++    out["candidate_shortlist"] = {
++        {"schema", "sage-live-proxy-shortlist-v0"},
++        {"source", "live_logit_top_k"},
++        {"candidate_token_ids", top_ids},
++        {"candidate_rows", top_ids.size()},
++        {"candidate_status", "live_logit_top_k_only"}
++    };
++    return out;
++}
++
++static json ledger_json(
++        const live_runner & proxy,
++        const live_runner & oracle,
++        const dual_params & params,
++        const common_sage_policy_result & decision,
++        const std::string & action,
++        const step_timing & timing) {
++    const bool used_oracle = action == "oracle_fallback";
++    const uint64_t verifier_active_bytes = 0;
++    const uint64_t oracle_active_bytes = used_oracle ? oracle.model_size_bytes : 0;
++    const uint64_t proxy_kv_bytes = proxy.kv_bytes_per_token_estimate * (uint64_t) std::max(proxy.n_pos, 0);
++    const kv_tier_account oracle_kv = estimate_tiered_kv_bytes(
++            oracle.n_pos,
++            oracle.kv_bytes_per_token_estimate,
++            params);
++
++    json ledger;
++    ledger["schema"] = "sage-active-byte-ledger-v0";
++    ledger["proxy_model_bytes"] = proxy.model_size_bytes;
++    ledger["oracle_model_bytes"] = oracle.model_size_bytes;
++    ledger["verifier_mode"] = decision.verifier_needed ? "missing_runtime_signal" : "none";
++    ledger["verifier_active_bytes"] = verifier_active_bytes;
++    ledger["verifier_blocks"] = json::array();
++    ledger["oracle_mode"] = used_oracle ? "exact_resident_context" : "none";
++    ledger["oracle_active_bytes"] = oracle_active_bytes;
++    ledger["oracle_active_percent_of_model"] = percent_of(oracle_active_bytes, oracle.model_size_bytes);
++    ledger["oracle_blocks"] = used_oracle ? json::array({"dense_model"}) : json::array();
++    ledger["gpu_staged_bytes"] = oracle_active_bytes;
++    ledger["host_pinned_bytes"] = nullptr;
++    ledger["pcie_transfer_ms"] = nullptr;
++    ledger["pcie_transfer_status"] = "not_measured_resident_context";
++    ledger["proxy_kv_tokens"] = proxy.n_pos;
++    ledger["oracle_kv_tokens"] = oracle.n_pos;
++    ledger["proxy_kv_bytes"] = proxy_kv_bytes;
++    ledger["proxy_kv_bytes_per_token_estimate"] = proxy.kv_bytes_per_token_estimate;
++    ledger["oracle_full_precision_kv_bytes"] = oracle_kv.full_precision_bytes;
++    ledger["oracle_hot_kv_tokens"] = oracle_kv.hot_tokens;
++    ledger["oracle_warm_kv_tokens"] = oracle_kv.warm_tokens;
++    ledger["oracle_cold_kv_tokens"] = oracle_kv.cold_tokens;
++    ledger["oracle_hot_kv_bytes"] = oracle_kv.hot_kv_bytes;
++    ledger["oracle_kv_bytes_per_token_estimate"] = oracle.kv_bytes_per_token_estimate;
++    ledger["oracle_warm_kv_bytes"] = oracle_kv.warm_kv_bytes;
++    ledger["oracle_cold_kv_bytes"] = oracle_kv.cold_kv_bytes;
++    ledger["oracle_tiered_kv_bytes"] = oracle_kv.tier_total_bytes;
++    ledger["oracle_kv_saved_percent_vs_full_precision"] = oracle_kv.saved_percent_vs_full_precision;
++    ledger["kv_byte_status"] = "tiered_runtime_accounting_not_attention_integrated";
++    ledger["kv_estimate_method"] = "runtime_tokens*f16_bpt_with_hot_recent_sink_and_lowbit_warm_accounting";
++    ledger["kv_attention_integration"] = false;
++    ledger["proxy_decode_ms"] = timing.proxy_decode_ms;
++    ledger["oracle_decode_ms"] = timing.oracle_decode_ms;
++    ledger["compute_ms"] = timing.proxy_decode_ms + timing.oracle_decode_ms;
++    ledger["total_step_ms"] = timing.total_step_ms;
++    return ledger;
++}
++
++static int run_self_test() {
++    const float logits[] = {0.0f, 3.0f, 1.0f};
++    const logit_stats stats = compute_logit_stats(logits, 3, 3);
++    if (stats.top1_id != 1 || stats.top2_id != 2 || stats.margin < 1.99 || stats.margin > 2.01) {
++        std::fprintf(stderr, "sage-dual-live self-test failed: logit stats\n");
++        return 1;
++    }
++    if (stats.top.size() != 3 || stats.top[0].id != 1 || stats.top[1].id != 2 || stats.top[2].id != 0) {
++        std::fprintf(stderr, "sage-dual-live self-test failed: logit top-k stats\n");
++        return 1;
++    }
++    if (token_class(" Paris") != "capitalized" ||
++            token_class(".") != "punct" ||
++            token_class("  ") != "whitespace" ||
++            token_class("42") != "number" ||
++            token_class(" is") != "word") {
++        std::fprintf(stderr, "sage-dual-live self-test failed: token class\n");
++        return 1;
++    }
++    if (percent_of(25, 100) < 24.99 || percent_of(25, 100) > 25.01 || percent_of(1, 0) != 0.0) {
++        std::fprintf(stderr, "sage-dual-live self-test failed: active-byte percent\n");
++        return 1;
++    }
++    if (estimate_f16_kv_bytes_per_token(24, 896, 14, 2) != 12288) {
++        std::fprintf(stderr, "sage-dual-live self-test failed: KV estimate\n");
++        return 1;
++    }
++    const dual_params defaults;
++    const kv_tier_account gemma_4k = estimate_tiered_kv_bytes(4096, 901120, defaults);
++    if (gemma_4k.hot_tokens != 528 ||
++            gemma_4k.warm_tokens != 3568 ||
++            gemma_4k.hot_kv_bytes != 475791360 ||
++            gemma_4k.warm_kv_bytes != 401899520 ||
++            gemma_4k.tier_total_bytes != 877690880) {
++        std::fprintf(stderr, "sage-dual-live self-test failed: tiered KV estimate\n");
++        return 1;
++    }
++    std::printf("SAGE dual live self-test passed\n");
++    return 0;
++}
++
++int main(int argc, char ** argv) {
++    std::setlocale(LC_NUMERIC, "C");
++
++    if (argc == 2 && std::strcmp(argv[1], "--self-test") == 0) {
++        return run_self_test();
++    }
++
++    dual_params params;
++    if (!parse_args(argc, argv, params)) {
++        print_usage(argv[0]);
++        return 1;
++    }
++
++    ggml_backend_load_all();
++
++    live_runner proxy;
++    live_runner oracle;
++    if (!init_runner(proxy, "proxy", params.proxy_model, params.prompt, params.proxy_ngl, params.n_ctx, params.n_predict) ||
++            !init_runner(oracle, "oracle", params.oracle_model, params.prompt, params.oracle_ngl, params.n_ctx, params.n_predict)) {
++        free_runner(proxy);
++        free_runner(oracle);
++        return 1;
++    }
++
++    const auto started = std::chrono::steady_clock::now();
++    json steps = json::array();
++    std::string final_text;
++    int proxy_accepts = 0;
++    int oracle_fallbacks = 0;
++    int verifier_needed = 0;
++    int generated = 0;
++
++    for (int step = 0; step < params.n_predict; ++step) {
++        const std::string prefix_before = final_text;
++        const auto step_started = std::chrono::steady_clock::now();
++        const auto proxy_started = step_started;
++        generated_token proxy_token = generate_one(proxy, params.logit_top_k);
++        const auto proxy_finished = std::chrono::steady_clock::now();
++        if (!proxy_token.ok) {
++            free_runner(proxy);
++            free_runner(oracle);
++            return 1;
++        }
++        if (proxy_token.eog) {
++            break;
++        }
++
++        common_sage_policy_input input;
++        input.candidate_id = "dual-" + std::to_string(step);
++        input.token_class = proxy_token.cls;
++        input.proxy_entropy = proxy_token.stats.entropy;
++        input.proxy_margin = proxy_token.stats.margin;
++        const common_sage_policy_result decision = common_sage_decide(input);
++
++        generated_token oracle_token;
++        std::string action = decision.action;
++        std::string reason = decision.reason;
++        std::string selected_source = "proxy";
++        std::string selected_text = proxy_token.piece;
++        llama_token proxy_native_selected = proxy_token.id;
++        llama_token oracle_native_selected = LLAMA_TOKEN_NULL;
++        step_timing timing;
++        timing.proxy_decode_ms = elapsed_ms(proxy_started, proxy_finished);
++
++        if (action == "oracle_fallback") {
++            const auto oracle_started = std::chrono::steady_clock::now();
++            oracle_token = generate_one(oracle, params.logit_top_k);
++            const auto oracle_finished = std::chrono::steady_clock::now();
++            timing.oracle_decode_ms = elapsed_ms(oracle_started, oracle_finished);
++            if (!oracle_token.ok) {
++                free_runner(proxy);
++                free_runner(oracle);
++                return 1;
++            }
++            if (oracle_token.eog) {
++                break;
++            }
++            selected_source = "oracle";
++            selected_text = oracle_token.piece;
++            proxy_native_selected = LLAMA_TOKEN_NULL;
++            oracle_native_selected = oracle_token.id;
++            oracle_fallbacks++;
++        } else {
++            proxy_accepts++;
++        }
++        if (decision.verifier_needed) {
++            verifier_needed++;
++        }
++
++        if (!append_selected(proxy, selected_text, proxy_native_selected) ||
++                !append_selected(oracle, selected_text, oracle_native_selected)) {
++            free_runner(proxy);
++            free_runner(oracle);
++            return 1;
++        }
++
++        final_text += selected_text;
++        generated++;
++        timing.total_step_ms = elapsed_ms(step_started, std::chrono::steady_clock::now());
++
++        json row;
++        row["step_index"] = step;
++        row["prefix_before"] = prefix_before;
++        row["proxy"] = token_json(proxy_token);
++        row["oracle"] = token_json(oracle_token);
++        row["proxy_gate_accept"] = decision.proxy_gate_accept;
++        row["verifier_needed"] = decision.verifier_needed;
++        row["verifier_covered"] = decision.verifier_covered;
++        row["verifier_accept"] = decision.verifier_covered ? json(decision.verifier_accept) : json(nullptr);
++        row["action"] = action;
++        row["reason"] = reason;
++        row["selected_source"] = selected_source;
++        row["selected_token"] = selected_text;
++        row["generated_text_after"] = final_text;
++        row["proxy_pending_tokens_after"] = proxy.pending.size();
++        row["oracle_pending_tokens_after"] = oracle.pending.size();
++        row["ledger"] = ledger_json(proxy, oracle, params, decision, action, timing);
++        steps.push_back(row);
++    }
++
++    const auto finished = std::chrono::steady_clock::now();
++    const double elapsed_sec = std::chrono::duration<double>(finished - started).count();
++
++    json output;
++    output["summary"] = {
++        {"proxy_model", params.proxy_model},
++        {"oracle_model", params.oracle_model},
++        {"ledger_schema", "sage-active-byte-ledger-v0"},
++        {"proxy_model_bytes", proxy.model_size_bytes},
++        {"oracle_model_bytes", oracle.model_size_bytes},
++        {"proxy_model_params", proxy.n_params},
++        {"oracle_model_params", oracle.n_params},
++        {"proxy_kv_bytes_per_token_estimate", proxy.kv_bytes_per_token_estimate},
++        {"oracle_kv_bytes_per_token_estimate", oracle.kv_bytes_per_token_estimate},
++        {"kv_byte_status", "tiered_runtime_accounting_not_attention_integrated"},
++        {"kv_hot_recent_tokens", params.kv_hot_recent_tokens},
++        {"kv_sink_tokens", params.kv_sink_tokens},
++        {"kv_warm_max_tokens", params.kv_warm_max_tokens},
++        {"kv_warm_bits", params.kv_warm_bits},
++        {"kv_cold_summary_dim", params.kv_cold_summary_dim},
++        {"kv_cold_summary_bits", params.kv_cold_summary_bits},
++        {"kv_attention_integration", false},
++        {"logit_top_k", params.logit_top_k},
++        {"candidate_shortlist_status", "live_logit_top_k_only"},
++        {"prompt", params.prompt},
++        {"generated_tokens", generated},
++        {"final_text", final_text},
++        {"elapsed_sec", elapsed_sec},
++        {"tokens_per_sec", elapsed_sec > 0.0 ? generated / elapsed_sec : 0.0},
++        {"proxy_accepts", proxy_accepts},
++        {"oracle_fallbacks", oracle_fallbacks},
++        {"verifier_needed", verifier_needed},
++        {"proxy_decode_calls", proxy.decode_calls},
++        {"oracle_decode_calls", oracle.decode_calls},
++        {"proxy_accepted_text_tokens", proxy.accepted_text_tokens},
++        {"oracle_accepted_text_tokens", oracle.accepted_text_tokens},
++    };
++    output["steps"] = steps;
++
++    if (params.json_out.empty() || params.json_out == "-") {
++        std::printf("%s\n", output.dump(2).c_str());
++    } else {
++        std::ofstream out(params.json_out, std::ios::out | std::ios::trunc);
++        if (!out.is_open()) {
++            std::fprintf(stderr, "sage-dual-live: failed to open --json-out\n");
++            free_runner(proxy);
++            free_runner(oracle);
++            return 1;
++        }
++        out << output.dump(2) << "\n";
++    }
++
++    free_runner(proxy);
++    free_runner(oracle);
++    return 0;
++}

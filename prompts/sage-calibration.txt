@@ -1,0 +1,32 @@
+# SAGE proxy/oracle calibration prompts.
+# Keep prompts short enough that first-token and early-token agreement are easy to inspect.
+The capital of France is
+In Python, a list comprehension is used to
+The main reason GPUs are useful for neural networks is
+When a program runs out of GPU memory, it can
+A transformer attention head computes
+The derivative of x squared is
+To sort a list in ascending order,
+The opposite of hot is
+A good unit test should
+The first step in debugging a crash is
+In C++, RAII means
+The purpose of a mutex is to
+If a neural network overfits, one common fix is
+The square root of 144 is
+HTTP status code 404 means
+Quantization reduces model memory by
+KV cache stores
+Speculative decoding uses a draft model to
+PCIe bandwidth matters for model offloading because
+A binary search requires the input to be
+The main risk of using a smaller proxy model is
+For matrix multiplication, GPUs are fast because
+An activation function such as ReLU
+In Git, a commit records
+The CPU is usually better than the GPU for
+If disk paging starts during inference, throughput
+The attention softmax converts scores into
+The term latency means
+A model router should call the oracle when
+Sparse inference is useful when

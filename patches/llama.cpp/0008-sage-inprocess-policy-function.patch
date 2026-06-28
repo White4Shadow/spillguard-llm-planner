@@ -1,0 +1,188 @@
+diff --git a/common/sage.h b/common/sage.h
+index 5a5c9c1..c3a91d1 100644
+--- a/common/sage.h
++++ b/common/sage.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <cstdint>
+ #include <memory>
+ #include <string>
+ #include <vector>
+@@ -18,6 +19,27 @@ struct common_sage_decision_params {
+     double      proxy_margin  = 0.0;
+ };
+ 
++struct common_sage_policy_input {
++    std::string candidate_id;
++    std::string token_class;
++    double      proxy_entropy       = 0.0;
++    double      proxy_margin        = 0.0;
++    bool        has_ffn_norm_0      = false;
++    int64_t     ffn_norm_0_sequence = -1;
++    double      ffn_norm_0_sum      = 0.0;
++};
++
++struct common_sage_policy_result {
++    bool        proxy_gate_accept = false;
++    bool        verifier_needed   = false;
++    bool        verifier_covered  = false;
++    bool        verifier_accept   = false;
++    const char * action           = "oracle_fallback";
++    const char * reason           = "proxy_gate_reject";
++};
++
++common_sage_policy_result common_sage_decide(const common_sage_policy_input & input);
++
+ struct common_sage_cb_user_data {
+     struct impl;
+     std::unique_ptr<impl> pimpl;
+diff --git a/common/sage.cpp b/common/sage.cpp
+index 61e8b4a..e2f16c5 100644
+--- a/common/sage.cpp
++++ b/common/sage.cpp
+@@ -38,62 +38,26 @@ struct common_sage_cb_user_data::impl {
+ 
+ static void common_sage_write_json_string(std::ostream & out, const char * value);
+ static void common_sage_write_json_number(std::ostream & out, double value);
++static void common_sage_write_decision_jsonl(
++        std::ostream &                         out,
++        const common_sage_policy_input &       input,
++        const common_sage_policy_result &      result);
+ 
+ common_sage_cb_user_data::common_sage_cb_user_data() : pimpl(std::make_unique<impl>()) {}
+ common_sage_cb_user_data::~common_sage_cb_user_data() {
+     auto * p = pimpl.get();
+     if (p != nullptr && p->decision_output.is_open()) {
+-        const bool proxy_gate_accept = p->decision_params.proxy_entropy <= 0.6 || p->decision_params.proxy_margin >= 1.5;
+-        const bool verifier_needed = proxy_gate_accept &&
+-                (p->decision_params.token_class == "punct" || p->decision_params.token_class == "capitalized");
+-        const bool verifier_covered = verifier_needed && p->latest_ffn_norm_0.has;
+-        const bool verifier_accept = verifier_covered &&
+-                (p->decision_params.proxy_entropy <= 0.040003470206379677 ||
+-                 p->latest_ffn_norm_0.stats.sum >= -72.150276000000005);
+-
+-        const char * action = "oracle_fallback";
+-        const char * reason = "proxy_gate_reject";
+-        if (proxy_gate_accept && !verifier_needed) {
+-            action = "accept_proxy";
+-            reason = "proxy_gate_non_verifier_class";
+-        } else if (verifier_needed && !verifier_covered) {
+-            reason = "missing_runtime_signal";
+-        } else if (verifier_needed && verifier_accept) {
+-            action = "accept_proxy";
+-            reason = "runtime_verifier_accept";
+-        } else if (verifier_needed) {
+-            reason = "runtime_verifier_reject";
+-        }
+-
+-        p->decision_output << "{\"candidate_id\":";
+-        common_sage_write_json_string(p->decision_output, p->decision_params.candidate_id.c_str());
+-        p->decision_output << ",\"token_class\":";
+-        common_sage_write_json_string(p->decision_output, p->decision_params.token_class.c_str());
+-        p->decision_output << ",\"proxy_entropy\":";
+-        common_sage_write_json_number(p->decision_output, p->decision_params.proxy_entropy);
+-        p->decision_output << ",\"proxy_margin\":";
+-        common_sage_write_json_number(p->decision_output, p->decision_params.proxy_margin);
+-        p->decision_output << ",\"proxy_gate_accept\":" << (proxy_gate_accept ? "true" : "false");
+-        p->decision_output << ",\"verifier_needed\":" << (verifier_needed ? "true" : "false");
+-        p->decision_output << ",\"verifier_covered\":" << (verifier_covered ? "true" : "false");
+-        p->decision_output << ",\"verifier_accept\":";
+-        if (verifier_covered) {
+-            p->decision_output << (verifier_accept ? "true" : "false");
+-        } else {
+-            p->decision_output << "null";
+-        }
+-        p->decision_output << ",\"ffn_norm_0_sequence\":" << (long long) p->latest_ffn_norm_0.sequence;
+-        p->decision_output << ",\"ffn_norm_0_sum\":";
+-        if (p->latest_ffn_norm_0.has) {
+-            common_sage_write_json_number(p->decision_output, p->latest_ffn_norm_0.stats.sum);
+-        } else {
+-            p->decision_output << "null";
+-        }
+-        p->decision_output << ",\"action\":";
+-        common_sage_write_json_string(p->decision_output, action);
+-        p->decision_output << ",\"reason\":";
+-        common_sage_write_json_string(p->decision_output, reason);
+-        p->decision_output << "}\n";
++        common_sage_policy_input input;
++        input.candidate_id        = p->decision_params.candidate_id;
++        input.token_class         = p->decision_params.token_class;
++        input.proxy_entropy       = p->decision_params.proxy_entropy;
++        input.proxy_margin        = p->decision_params.proxy_margin;
++        input.has_ffn_norm_0      = p->latest_ffn_norm_0.has;
++        input.ffn_norm_0_sequence = p->latest_ffn_norm_0.sequence;
++        input.ffn_norm_0_sum      = p->latest_ffn_norm_0.stats.sum;
++
++        const common_sage_policy_result result = common_sage_decide(input);
++        common_sage_write_decision_jsonl(p->decision_output, input, result);
+         p->decision_output.flush();
+     }
+ }
+@@ -221,6 +182,66 @@ static void common_sage_write_json_number(std::ostream & out, double value) {
+     }
+ }
+ 
++common_sage_policy_result common_sage_decide(const common_sage_policy_input & input) {
++    common_sage_policy_result result;
++    result.proxy_gate_accept = input.proxy_entropy <= 0.6 || input.proxy_margin >= 1.5;
++    result.verifier_needed = result.proxy_gate_accept &&
++            (input.token_class == "punct" || input.token_class == "capitalized");
++    result.verifier_covered = result.verifier_needed && input.has_ffn_norm_0;
++    result.verifier_accept = result.verifier_covered &&
++            (input.proxy_entropy <= 0.040003470206379677 ||
++             input.ffn_norm_0_sum >= -72.150276000000005);
++
++    if (result.proxy_gate_accept && !result.verifier_needed) {
++        result.action = "accept_proxy";
++        result.reason = "proxy_gate_non_verifier_class";
++    } else if (result.verifier_needed && !result.verifier_covered) {
++        result.reason = "missing_runtime_signal";
++    } else if (result.verifier_needed && result.verifier_accept) {
++        result.action = "accept_proxy";
++        result.reason = "runtime_verifier_accept";
++    } else if (result.verifier_needed) {
++        result.reason = "runtime_verifier_reject";
++    }
++
++    return result;
++}
++
++static void common_sage_write_decision_jsonl(
++        std::ostream &                         out,
++        const common_sage_policy_input &       input,
++        const common_sage_policy_result &      result) {
++    out << "{\"candidate_id\":";
++    common_sage_write_json_string(out, input.candidate_id.c_str());
++    out << ",\"token_class\":";
++    common_sage_write_json_string(out, input.token_class.c_str());
++    out << ",\"proxy_entropy\":";
++    common_sage_write_json_number(out, input.proxy_entropy);
++    out << ",\"proxy_margin\":";
++    common_sage_write_json_number(out, input.proxy_margin);
++    out << ",\"proxy_gate_accept\":" << (result.proxy_gate_accept ? "true" : "false");
++    out << ",\"verifier_needed\":" << (result.verifier_needed ? "true" : "false");
++    out << ",\"verifier_covered\":" << (result.verifier_covered ? "true" : "false");
++    out << ",\"verifier_accept\":";
++    if (result.verifier_covered) {
++        out << (result.verifier_accept ? "true" : "false");
++    } else {
++        out << "null";
++    }
++    out << ",\"ffn_norm_0_sequence\":" << (long long) input.ffn_norm_0_sequence;
++    out << ",\"ffn_norm_0_sum\":";
++    if (input.has_ffn_norm_0) {
++        common_sage_write_json_number(out, input.ffn_norm_0_sum);
++    } else {
++        out << "null";
++    }
++    out << ",\"action\":";
++    common_sage_write_json_string(out, result.action);
++    out << ",\"reason\":";
++    common_sage_write_json_string(out, result.reason);
++    out << "}\n";
++}
++
+ static void common_sage_write_jsonl(
+         std::ostream &                    out,
+         int64_t                           sequence,

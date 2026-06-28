@@ -1,0 +1,253 @@
+diff --git a/examples/CMakeLists.txt b/examples/CMakeLists.txt
+index 4c1e10b..c89eae5 100644
+--- a/examples/CMakeLists.txt
++++ b/examples/CMakeLists.txt
+@@ -28,6 +28,7 @@ else()
+     add_subdirectory(parallel)
+     add_subdirectory(passkey)
+     add_subdirectory(retrieval)
++    add_subdirectory(sage-policy-check)
+     add_subdirectory(simple)
+     add_subdirectory(simple-chat)
+     add_subdirectory(speculative)
+diff --git a/examples/sage-policy-check/CMakeLists.txt b/examples/sage-policy-check/CMakeLists.txt
+new file mode 100644
+index 0000000..5b7cf34
+--- /dev/null
++++ b/examples/sage-policy-check/CMakeLists.txt
+@@ -0,0 +1,5 @@
++set(TARGET llama-sage-policy-check)
++add_executable(${TARGET} sage-policy-check.cpp)
++install(TARGETS ${TARGET} RUNTIME)
++target_link_libraries(${TARGET} PRIVATE llama-common llama ${CMAKE_THREAD_LIBS_INIT})
++target_compile_features(${TARGET} PRIVATE cxx_std_17)
+diff --git a/examples/sage-policy-check/sage-policy-check.cpp b/examples/sage-policy-check/sage-policy-check.cpp
+new file mode 100644
+index 0000000..908f91a
+--- /dev/null
++++ b/examples/sage-policy-check/sage-policy-check.cpp
+@@ -0,0 +1,224 @@
++#include "sage.h"
++
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++
++struct test_case {
++    const char * name;
++    common_sage_policy_input input;
++    const char * action;
++    const char * reason;
++};
++
++static void print_usage(const char * argv0) {
++    std::fprintf(stderr,
++            "usage: %s [--self-test] [--candidate-id ID] --token-class CLASS "
++            "--proxy-entropy N --proxy-margin N [--ffn-norm-0-sum N] "
++            "[--ffn-norm-0-sequence N] [--expect-action ACTION] [--expect-reason REASON]\n",
++            argv0);
++}
++
++static bool parse_double(const char * raw, double & out) {
++    char * end = nullptr;
++    out = std::strtod(raw, &end);
++    return end != raw && end != nullptr && *end == '\0' && std::isfinite(out);
++}
++
++static bool parse_i64(const char * raw, int64_t & out) {
++    char * end = nullptr;
++    out = std::strtoll(raw, &end, 10);
++    return end != raw && end != nullptr && *end == '\0';
++}
++
++static void print_json_string(const char * value) {
++    std::putchar('"');
++    for (const char * p = value; *p != '\0'; ++p) {
++        const unsigned char c = (unsigned char) *p;
++        switch (c) {
++            case '"':  std::printf("\\\""); break;
++            case '\\': std::printf("\\\\"); break;
++            case '\b': std::printf("\\b");  break;
++            case '\f': std::printf("\\f");  break;
++            case '\n': std::printf("\\n");  break;
++            case '\r': std::printf("\\r");  break;
++            case '\t': std::printf("\\t");  break;
++            default:
++                std::putchar(c < 0x20 ? '?' : (char) c);
++                break;
++        }
++    }
++    std::putchar('"');
++}
++
++static void print_decision_json(const common_sage_policy_input & input, const common_sage_policy_result & result) {
++    std::printf("{\"candidate_id\":");
++    print_json_string(input.candidate_id.c_str());
++    std::printf(",\"token_class\":");
++    print_json_string(input.token_class.c_str());
++    std::printf(",\"proxy_entropy\":%.17g", input.proxy_entropy);
++    std::printf(",\"proxy_margin\":%.17g", input.proxy_margin);
++    std::printf(",\"proxy_gate_accept\":%s", result.proxy_gate_accept ? "true" : "false");
++    std::printf(",\"verifier_needed\":%s", result.verifier_needed ? "true" : "false");
++    std::printf(",\"verifier_covered\":%s", result.verifier_covered ? "true" : "false");
++    std::printf(",\"verifier_accept\":");
++    if (result.verifier_covered) {
++        std::printf("%s", result.verifier_accept ? "true" : "false");
++    } else {
++        std::printf("null");
++    }
++    std::printf(",\"ffn_norm_0_sequence\":%lld", (long long) input.ffn_norm_0_sequence);
++    std::printf(",\"ffn_norm_0_sum\":");
++    if (input.has_ffn_norm_0) {
++        std::printf("%.17g", input.ffn_norm_0_sum);
++    } else {
++        std::printf("null");
++    }
++    std::printf(",\"action\":");
++    print_json_string(result.action);
++    std::printf(",\"reason\":");
++    print_json_string(result.reason);
++    std::printf("}\n");
++}
++
++static int run_self_test() {
++    std::vector<test_case> tests;
++
++    common_sage_policy_input reject;
++    reject.candidate_id = "reject";
++    reject.token_class = "capitalized";
++    reject.proxy_entropy = 1.0;
++    reject.proxy_margin = 0.1;
++    reject.has_ffn_norm_0 = true;
++    reject.ffn_norm_0_sequence = 0;
++    reject.ffn_norm_0_sum = 100.0;
++    tests.push_back({"proxy gate reject", reject, "oracle_fallback", "proxy_gate_reject"});
++
++    common_sage_policy_input whitespace;
++    whitespace.candidate_id = "whitespace";
++    whitespace.token_class = "whitespace";
++    whitespace.proxy_entropy = 0.5;
++    whitespace.proxy_margin = 0.1;
++    tests.push_back({"non-verifier class accept", whitespace, "accept_proxy", "proxy_gate_non_verifier_class"});
++
++    common_sage_policy_input missing;
++    missing.candidate_id = "missing";
++    missing.token_class = "punct";
++    missing.proxy_entropy = 0.5;
++    missing.proxy_margin = 0.1;
++    tests.push_back({"missing verifier signal", missing, "oracle_fallback", "missing_runtime_signal"});
++
++    common_sage_policy_input entropy_accept;
++    entropy_accept.candidate_id = "entropy-accept";
++    entropy_accept.token_class = "capitalized";
++    entropy_accept.proxy_entropy = 0.02;
++    entropy_accept.proxy_margin = 0.1;
++    entropy_accept.has_ffn_norm_0 = true;
++    entropy_accept.ffn_norm_0_sequence = 1;
++    entropy_accept.ffn_norm_0_sum = -100.0;
++    tests.push_back({"entropy verifier accept", entropy_accept, "accept_proxy", "runtime_verifier_accept"});
++
++    common_sage_policy_input ffn_accept;
++    ffn_accept.candidate_id = "ffn-accept";
++    ffn_accept.token_class = "punct";
++    ffn_accept.proxy_entropy = 0.5;
++    ffn_accept.proxy_margin = 0.1;
++    ffn_accept.has_ffn_norm_0 = true;
++    ffn_accept.ffn_norm_0_sequence = 2;
++    ffn_accept.ffn_norm_0_sum = -50.0;
++    tests.push_back({"ffn verifier accept", ffn_accept, "accept_proxy", "runtime_verifier_accept"});
++
++    common_sage_policy_input ffn_reject;
++    ffn_reject.candidate_id = "ffn-reject";
++    ffn_reject.token_class = "capitalized";
++    ffn_reject.proxy_entropy = 0.5;
++    ffn_reject.proxy_margin = 0.1;
++    ffn_reject.has_ffn_norm_0 = true;
++    ffn_reject.ffn_norm_0_sequence = 3;
++    ffn_reject.ffn_norm_0_sum = -100.0;
++    tests.push_back({"ffn verifier reject", ffn_reject, "oracle_fallback", "runtime_verifier_reject"});
++
++    for (const auto & item : tests) {
++        const common_sage_policy_result result = common_sage_decide(item.input);
++        if (std::strcmp(result.action, item.action) != 0 || std::strcmp(result.reason, item.reason) != 0) {
++            std::fprintf(stderr, "self-test failed: %s\n", item.name);
++            std::fprintf(stderr, "expected action=%s reason=%s\n", item.action, item.reason);
++            std::fprintf(stderr, "actual action=%s reason=%s\n", result.action, result.reason);
++            return 1;
++        }
++    }
++
++    std::printf("SAGE policy self-test passed: %zu cases\n", tests.size());
++    return 0;
++}
++
++int main(int argc, char ** argv) {
++    common_sage_policy_input input;
++    input.candidate_id = "manual";
++    const char * expect_action = nullptr;
++    const char * expect_reason = nullptr;
++    bool have_entropy = false;
++    bool have_margin = false;
++
++    for (int i = 1; i < argc; ++i) {
++        if (std::strcmp(argv[i], "--self-test") == 0) {
++            return run_self_test();
++        } else if (std::strcmp(argv[i], "--candidate-id") == 0 && i + 1 < argc) {
++            input.candidate_id = argv[++i];
++        } else if (std::strcmp(argv[i], "--token-class") == 0 && i + 1 < argc) {
++            input.token_class = argv[++i];
++        } else if (std::strcmp(argv[i], "--proxy-entropy") == 0 && i + 1 < argc) {
++            if (!parse_double(argv[++i], input.proxy_entropy)) {
++                print_usage(argv[0]);
++                return 1;
++            }
++            have_entropy = true;
++        } else if (std::strcmp(argv[i], "--proxy-margin") == 0 && i + 1 < argc) {
++            if (!parse_double(argv[++i], input.proxy_margin)) {
++                print_usage(argv[0]);
++                return 1;
++            }
++            have_margin = true;
++        } else if (std::strcmp(argv[i], "--ffn-norm-0-sum") == 0 && i + 1 < argc) {
++            if (!parse_double(argv[++i], input.ffn_norm_0_sum)) {
++                print_usage(argv[0]);
++                return 1;
++            }
++            input.has_ffn_norm_0 = true;
++        } else if (std::strcmp(argv[i], "--ffn-norm-0-sequence") == 0 && i + 1 < argc) {
++            if (!parse_i64(argv[++i], input.ffn_norm_0_sequence)) {
++                print_usage(argv[0]);
++                return 1;
++            }
++        } else if (std::strcmp(argv[i], "--expect-action") == 0 && i + 1 < argc) {
++            expect_action = argv[++i];
++        } else if (std::strcmp(argv[i], "--expect-reason") == 0 && i + 1 < argc) {
++            expect_reason = argv[++i];
++        } else {
++            print_usage(argv[0]);
++            return 1;
++        }
++    }
++
++    if (input.token_class.empty() || !have_entropy || !have_margin) {
++        print_usage(argv[0]);
++        return 1;
++    }
++
++    const common_sage_policy_result result = common_sage_decide(input);
++    print_decision_json(input, result);
++
++    if (expect_action != nullptr && std::strcmp(result.action, expect_action) != 0) {
++        std::fprintf(stderr, "expected action=%s, got action=%s\n", expect_action, result.action);
++        return 2;
++    }
++    if (expect_reason != nullptr && std::strcmp(result.reason, expect_reason) != 0) {
++        std::fprintf(stderr, "expected reason=%s, got reason=%s\n", expect_reason, result.reason);
++        return 2;
++    }
++
++    return 0;
++}

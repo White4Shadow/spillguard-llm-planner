@@ -1,0 +1,29 @@
+diff --git a/common/debug.cpp b/common/debug.cpp
+index 000000000..000000001 100644
+--- a/common/debug.cpp
++++ b/common/debug.cpp
+@@ -148,18 +148,18 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
+     const struct ggml_tensor * src0 = t->src[0];
+     const struct ggml_tensor * src1 = t->src[1];
+ 
+-    if (ask) {
+-        return true;  // Always retrieve data
+-    }
+-
+     bool matches_filter = pimpl->tensor_filters.empty();
+ 
+     if (!matches_filter) {
+         for (const auto & filter : pimpl->tensor_filters) {
+             if (std::regex_search(t->name, filter)) {
+                 matches_filter = true;
+                 break;
+             }
+         }
+     }
++
++    if (ask) {
++        return matches_filter;
++    }
+ 
+     char src1_str[128] = { 0 };
+     if (src1) {

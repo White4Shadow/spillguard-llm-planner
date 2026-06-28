@@ -1,0 +1,124 @@
+# Harder SAGE proxy/oracle calibration prompts.
+# Purpose: stress token-class routers beyond easy punctuation and whitespace.
+# Keep each prompt short enough for early-token agreement and replay checks.
+
+In a race condition, two threads
+The safest way to handle untrusted JSON is
+When a CUDA kernel launch fails, the next step is
+The phrase amortized constant time means
+In a B-tree, each internal node
+If a database index is missing, a query planner may
+A deadlock can happen when
+The main difference between TCP and UDP is
+When parsing command-line flags, a robust parser should
+In Rust, ownership prevents
+The C preprocessor runs before
+If a compiler inlines a function, it
+A memory barrier is used to
+The fastest algorithm is not always best because
+When a benchmark result changes, first check
+The word idempotent means that repeating an operation
+In a distributed system, clock skew can
+A cache stampede occurs when
+The CAP theorem states that a distributed database cannot
+If a lock is held too long, latency
+The derivative of sin x is
+The integral of 1/x is
+If a matrix is singular, its determinant is
+The dot product of orthogonal vectors is
+For a normal distribution, about 68 percent of values
+If p implies q and p is false, then
+The probability of two independent events both happening is
+Bayes theorem updates a belief by
+The square root of a negative real number is
+In modular arithmetic, 17 mod 5 equals
+A transformer residual connection helps because
+Layer normalization usually normalizes over
+The attention mask prevents tokens from
+If the KV cache is quantized too aggressively, the model may
+Speculative decoding is correct only when verification
+A draft model is useful when its accepted tokens
+The acceptance rate in speculative decoding falls when
+If the proxy model diverges early, replay should
+An oracle verifier should be called when
+The byte budget per token is lower when target TPS
+PCIe transfer latency matters most when
+NVMe offload is slower than RAM because
+Paged attention helps serving systems by
+A hot neuron is one that
+Activation sparsity can speed inference if
+Weight sparsity is hard to exploit when
+Quantization error is most dangerous when
+KV cache compression trades memory for
+If attention sinks are removed, long-context quality may
+The first few transformer layers often
+The last transformer layers often
+A low-rank adapter can approximate
+If a sparse verifier is too conservative, speed
+If a sparse verifier accepts bad tokens, quality
+An exact fallback path is necessary because
+The active-byte scheduler should choose
+When GPU memory is nearly full, the runtime should
+If CPU RAM starts paging, inference speed
+The best layer offload count depends on
+Full GPU offload can be slower when
+The purpose of llama.cpp n_gpu_layers is
+The difference between prefill and decode is
+A prompt cache is useful when
+If a tokenizer treats spaces as part of tokens, then
+A token-class router should be careful with
+Whitespace tokens are often easier because
+Punctuation tokens can still change meaning when
+Capitalized word tokens are risky because
+Numeric tokens are risky because
+A newline after a bullet often means
+In Markdown, a heading starts with
+In JSON, a trailing comma is
+In YAML, indentation is
+In SQL, a join combines
+The WHERE clause filters
+The GROUP BY clause is used to
+If a migration fails halfway, the database
+The safest way to store passwords is
+An access token should expire because
+TLS protects data by
+If input validation is missing, an attacker can
+Path traversal attacks use
+Cross-site scripting happens when
+SQL injection can occur when
+The principle of least privilege means
+In Git, rebase changes
+In Git, merge preserves
+If a commit is reverted, the history
+A pull request review should focus on
+Continuous integration catches
+A flaky test is dangerous because
+The fastest way to find text in a repo is
+If a Python list is modified during iteration,
+In Python, a generator yields
+The difference between is and == is
+An exception should be caught when
+The with statement in Python ensures
+In JavaScript, a promise represents
+In TypeScript, unknown is safer than any because
+In React, state updates are
+A controlled input stores its value
+CSS grid is useful for
+If text overflows a button, the UI should
+A dashboard metric should define
+An average can hide
+A p95 latency value means
+If a sample is biased, the conclusion
+A correlation does not prove
+The null hypothesis is rejected when
+An ablation study tests
+A calibration set should be separate from
+Overfitting a router would look like
+The next experiment should fail fast if
+If a 100B model is used as an oracle, it should
+A consumer GPU runtime should measure
+The central SAGE assumption is
+If the oracle is called every token, SAGE
+The main unresolved risk is
+The fastest safe policy will probably
+If this experiment succeeds, the next proof is

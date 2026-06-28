@@ -1,0 +1,87 @@
+# Fresh SAGE validation set C.
+# Frozen proxy gate:
+#   proxy_entropy <= 0.6 OR proxy_margin >= 1.5
+# Frozen sparse verifier candidate classes:
+#   punct, capitalized
+# Frozen sparse verifier rule family for first test:
+#   proxy.entropy <= 0.040003470206379677 OR ffn_norm_0.sum >= -72.150276000000005
+When a database transaction rolls back, the application should
+The safest way to rotate API keys is
+If a TLS certificate expires, clients will
+A cache stampede can happen when
+The main benefit of idempotent retries is
+When a Kubernetes pod is evicted, the service
+In a REST API, a 409 status usually means
+A circuit breaker protects a system by
+If a queue consumer crashes after processing, the message
+The difference between authentication and authorization is
+When a cron job overlaps with itself, one fix is
+An optimistic lock fails when
+The purpose of a migration rollback is
+If DNS resolution is slow, the first metric to check is
+In an event-sourced system, the source of truth is
+A database index improves reads by
+When a schema change is backward compatible, old clients
+The safest response to a partial deploy is
+If a load balancer marks an instance unhealthy, traffic
+The purpose of a health check endpoint is
+In Python, a context manager is useful because
+When JavaScript promises reject, the caller should
+If a Rust borrow checker error appears, the code likely
+A SQL injection vulnerability occurs when
+The purpose of prepared statements is
+When a Git rebase conflicts, the developer should
+In TypeScript, a union type means
+If a function mutates shared state, tests should
+A race condition appears when
+The main reason to use dependency injection is
+When memory usage grows over time, suspect
+If a loop blocks the event loop, the application
+The purpose of pagination is
+When a file upload is too large, the server should
+A good error message should include
+If a feature flag is disabled, the code path
+The purpose of structured logging is
+When a metric has high cardinality, storage costs
+If alert noise is too high, operators should
+A good runbook starts with
+When an embedding model changes, stored vectors should
+The purpose of a reranker is
+If retrieval returns irrelevant passages, the system should
+A vector index trades exactness for
+When a chunk is too large, retrieval quality
+The role of a system prompt is
+If a tool call fails, the model should
+A hallucinated citation is dangerous because
+When evaluating an LLM answer, compare it against
+The purpose of a guardrail is
+If a model refuses a safe request, the policy
+A tokenizer split can affect
+When quantization is too aggressive, the model may
+The main risk of speculative decoding is
+If a draft model is poorly aligned, acceptance
+A KV cache stores
+When context length increases, memory use
+The purpose of attention sinks is
+If old KV entries are compressed, quality can
+A sparse verifier should reject
+When a proxy model is overconfident, the oracle
+If a verifier false-rejects too often, throughput
+The purpose of active-byte budgeting is
+When PCIe bandwidth is the bottleneck, streaming
+If weights are paged from CPU RAM, latency
+A hot FFN group should stay
+When the oracle path is exact, speed
+If the sparse path is approximate, the UI should
+A fresh validation set prevents
+When a benchmark uses only easy prompts, results
+If a threshold is tuned on validation, it
+The purpose of held-out prompts is
+When a rule catches punctuation failures, test
+If capitalized tokens diverge, the verifier should
+A robust router should fail closed when
+When accepted-token error is above target, the runtime
+If total token error is low but concentrated, users
+The next experiment should freeze
+A production claim requires
+The final report should separate

@@ -6,6 +6,15 @@ benchmarks/*.json
 benchmarks/*.jsonl
 benchmarks/*.log
 benchmarks/*.md
+benchmarks/sage-agreement-logs/
+benchmarks/sage-logprob-logs/
+benchmarks/sage-live-logs/
+benchmarks/sage-live-verifier-logs/
+benchmarks/sage-probe-logs/
+benchmarks/sage-replay-logs/
+benchmarks/sage-runtime-logs/
+bench-*.csv
+bench-*.log
 phase-cache*/
 profiles/*.json
 profiles/*.jsonl

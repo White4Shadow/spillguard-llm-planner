@@ -1,0 +1,274 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 62bf8e3..ecc5602 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -3417,6 +3417,41 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.sage_tensor_stats_output = value;
+         }
+     ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
++    add_opt(common_arg(
++        {"--sage-decision-output"}, "PATH",
++        "write one final SAGE scheduler decision JSONL event using the frozen FFN-sentinel rule",
++        [](common_params & params, const std::string & value) {
++            params.sage_decision_output = value;
++        }
++    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
++    add_opt(common_arg(
++        {"--sage-candidate-id"}, "ID",
++        "candidate id included in SAGE decision output",
++        [](common_params & params, const std::string & value) {
++            params.sage_candidate_id = value;
++        }
++    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
++    add_opt(common_arg(
++        {"--sage-token-class"}, "CLASS",
++        "proxy token class included in SAGE decision output (for example punct or capitalized)",
++        [](common_params & params, const std::string & value) {
++            params.sage_token_class = value;
++        }
++    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
++    add_opt(common_arg(
++        {"--sage-proxy-entropy"}, "N",
++        "proxy entropy used by the frozen SAGE verifier rule",
++        [](common_params & params, const std::string & value) {
++            params.sage_proxy_entropy = std::stod(value);
++        }
++    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
++    add_opt(common_arg(
++        {"--sage-proxy-margin"}, "N",
++        "proxy margin used by the frozen SAGE proxy gate",
++        [](common_params & params, const std::string & value) {
++            params.sage_proxy_margin = std::stod(value);
++        }
++    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
+     add_opt(common_arg(
+         {"--log-colors"}, "[on|off|auto]",
+         "Set colored logging ('on', 'off', or 'auto', default: 'auto')\n"
+diff --git a/common/common.cpp b/common/common.cpp
+index da89fa8..dbe6516 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1292,18 +1292,25 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+         cparams.n_samplers = pimpl->samplers_seq_config.size();
+     }
+ 
+-    if (!params.sage_tensor_stats_output.empty()) {
++    if (!params.sage_tensor_stats_output.empty() || !params.sage_decision_output.empty()) {
+         if (params.sage_tensor_filter.empty()) {
+-            LOG_ERR("%s: --sage-tensor-stats-output requires at least one --sage-tensor-filter\n", __func__);
++            LOG_ERR("%s: SAGE runtime output requires at least one --sage-tensor-filter\n", __func__);
+             return;
+         }
+         if (cparams.cb_eval != nullptr) {
+-            LOG_ERR("%s: --sage-tensor-stats-output cannot be combined with another scheduler eval callback\n", __func__);
++            LOG_ERR("%s: SAGE runtime output cannot be combined with another scheduler eval callback\n", __func__);
+             return;
+         }
++        common_sage_decision_params sage_decision_params;
++        sage_decision_params.output_path    = params.sage_decision_output;
++        sage_decision_params.candidate_id   = params.sage_candidate_id;
++        sage_decision_params.token_class    = params.sage_token_class;
++        sage_decision_params.proxy_entropy  = params.sage_proxy_entropy;
++        sage_decision_params.proxy_margin   = params.sage_proxy_margin;
+         pimpl->sage_cb_data = std::make_unique<common_sage_cb_user_data>(
+                 params.sage_tensor_filter,
+-                params.sage_tensor_stats_output);
++                params.sage_tensor_stats_output,
++                sage_decision_params);
+         cparams.cb_eval           = common_sage_cb_eval;
+         cparams.cb_eval_user_data = pimpl->sage_cb_data.get();
+     }
+diff --git a/common/common.h b/common/common.h
+index 3a21fe5..ca8fc75 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -480,8 +480,13 @@ struct common_params {
+     void * cb_eval_user_data                 = nullptr;
+ 
+     // SAGE runtime tensor-stat signal options
+-    std::string sage_tensor_stats_output = "";  // JSONL path for matched runtime tensor statistics          // NOLINT
+-    std::vector<std::string> sage_tensor_filter; // filter tensor names for SAGE runtime stats (regex)       // NOLINT
++    std::string sage_tensor_stats_output = "";  // JSONL path for matched runtime tensor statistics                // NOLINT
++    std::string sage_decision_output     = "";  // JSONL path for final SAGE scheduler decision event               // NOLINT
++    std::string sage_candidate_id        = "";  // candidate id included in SAGE decision output                    // NOLINT
++    std::string sage_token_class         = "";  // proxy token class included in SAGE decision output               // NOLINT
++    double      sage_proxy_entropy       = 0.0; // proxy entropy used by frozen SAGE verifier rule                  // NOLINT
++    double      sage_proxy_margin        = 0.0; // proxy margin used by frozen SAGE proxy gate                      // NOLINT
++    std::vector<std::string> sage_tensor_filter; // filter tensor names for SAGE runtime stats (regex)             // NOLINT
+ 
+     ggml_numa_strategy numa = GGML_NUMA_STRATEGY_DISABLED;
+ 
+diff --git a/common/sage.cpp b/common/sage.cpp
+index c1e7390..9e53586 100644
+--- a/common/sage.cpp
++++ b/common/sage.cpp
+@@ -20,19 +20,92 @@ struct common_sage_tensor_stats {
+     int64_t nan_count = 0;
+ };
+ 
++struct common_sage_latest_tensor {
++    bool                     has      = false;
++    int64_t                  sequence = -1;
++    std::string              name;
++    common_sage_tensor_stats stats;
++};
++
+ struct common_sage_cb_user_data::impl {
+-    std::vector<uint8_t>    data;
+-    std::vector<std::regex> tensor_filters;
+-    std::ofstream           output;
+-    int64_t                 sequence{0};
++    std::vector<uint8_t>          data;
++    std::vector<std::regex>       tensor_filters;
++    std::ofstream                 stats_output;
++    std::ofstream                 decision_output;
++    common_sage_decision_params   decision_params;
++    common_sage_latest_tensor     latest_ffn_norm_0;
++    int64_t                       sequence{0};
+ };
+ 
++static void common_sage_write_json_string(std::ostream & out, const char * value);
++static void common_sage_write_json_number(std::ostream & out, double value);
++
+ common_sage_cb_user_data::common_sage_cb_user_data() : pimpl(std::make_unique<impl>()) {}
+-common_sage_cb_user_data::~common_sage_cb_user_data() = default;
++common_sage_cb_user_data::~common_sage_cb_user_data() {
++    auto * p = pimpl.get();
++    if (p != nullptr && p->decision_output.is_open()) {
++        const bool proxy_gate_accept = p->decision_params.proxy_entropy <= 0.6 || p->decision_params.proxy_margin >= 1.5;
++        const bool verifier_needed = proxy_gate_accept &&
++                (p->decision_params.token_class == "punct" || p->decision_params.token_class == "capitalized");
++        const bool verifier_covered = verifier_needed && p->latest_ffn_norm_0.has;
++        const bool verifier_accept = verifier_covered &&
++                (p->decision_params.proxy_entropy <= 0.040003470206379677 ||
++                 p->latest_ffn_norm_0.stats.sum >= -72.150276000000005);
+ 
+-common_sage_cb_user_data::common_sage_cb_user_data(const std::vector<std::string> & filter_patterns, const std::string & output_path)
++        const char * action = "oracle_fallback";
++        const char * reason = "proxy_gate_reject";
++        if (proxy_gate_accept && !verifier_needed) {
++            action = "accept_proxy";
++            reason = "proxy_gate_non_verifier_class";
++        } else if (verifier_needed && !verifier_covered) {
++            reason = "missing_runtime_signal";
++        } else if (verifier_needed && verifier_accept) {
++            action = "accept_proxy";
++            reason = "runtime_verifier_accept";
++        } else if (verifier_needed) {
++            reason = "runtime_verifier_reject";
++        }
++
++        p->decision_output << "{\"candidate_id\":";
++        common_sage_write_json_string(p->decision_output, p->decision_params.candidate_id.c_str());
++        p->decision_output << ",\"token_class\":";
++        common_sage_write_json_string(p->decision_output, p->decision_params.token_class.c_str());
++        p->decision_output << ",\"proxy_entropy\":";
++        common_sage_write_json_number(p->decision_output, p->decision_params.proxy_entropy);
++        p->decision_output << ",\"proxy_margin\":";
++        common_sage_write_json_number(p->decision_output, p->decision_params.proxy_margin);
++        p->decision_output << ",\"proxy_gate_accept\":" << (proxy_gate_accept ? "true" : "false");
++        p->decision_output << ",\"verifier_needed\":" << (verifier_needed ? "true" : "false");
++        p->decision_output << ",\"verifier_covered\":" << (verifier_covered ? "true" : "false");
++        p->decision_output << ",\"verifier_accept\":";
++        if (verifier_covered) {
++            p->decision_output << (verifier_accept ? "true" : "false");
++        } else {
++            p->decision_output << "null";
++        }
++        p->decision_output << ",\"ffn_norm_0_sequence\":" << (long long) p->latest_ffn_norm_0.sequence;
++        p->decision_output << ",\"ffn_norm_0_sum\":";
++        if (p->latest_ffn_norm_0.has) {
++            common_sage_write_json_number(p->decision_output, p->latest_ffn_norm_0.stats.sum);
++        } else {
++            p->decision_output << "null";
++        }
++        p->decision_output << ",\"action\":";
++        common_sage_write_json_string(p->decision_output, action);
++        p->decision_output << ",\"reason\":";
++        common_sage_write_json_string(p->decision_output, reason);
++        p->decision_output << "}\n";
++        p->decision_output.flush();
++    }
++}
++
++common_sage_cb_user_data::common_sage_cb_user_data(
++        const std::vector<std::string> & filter_patterns,
++        const std::string &              stats_output_path,
++        const common_sage_decision_params & decision_params)
+     : pimpl(std::make_unique<impl>())
+ {
++    pimpl->decision_params = decision_params;
+     for (const auto & pattern : filter_patterns) {
+         try {
+             std::string anchored_pattern = "^" + pattern;
+@@ -42,9 +115,18 @@ common_sage_cb_user_data::common_sage_cb_user_data(const std::vector<std::string
+         }
+     }
+ 
+-    pimpl->output.open(output_path, std::ios::out | std::ios::trunc);
+-    if (!pimpl->output.is_open()) {
+-        throw std::runtime_error("failed to open --sage-tensor-stats-output: " + output_path);
++    if (!stats_output_path.empty()) {
++        pimpl->stats_output.open(stats_output_path, std::ios::out | std::ios::trunc);
++        if (!pimpl->stats_output.is_open()) {
++            throw std::runtime_error("failed to open --sage-tensor-stats-output: " + stats_output_path);
++        }
++    }
++
++    if (!decision_params.output_path.empty()) {
++        pimpl->decision_output.open(decision_params.output_path, std::ios::out | std::ios::trunc);
++        if (!pimpl->decision_output.is_open()) {
++            throw std::runtime_error("failed to open --sage-decision-output: " + decision_params.output_path);
++        }
+     }
+ }
+ 
+@@ -201,8 +283,17 @@ bool common_sage_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
+ 
+     const uint8_t * data = is_host ? (const uint8_t *) t->data : pimpl->data.data();
+     const common_sage_tensor_stats stats = common_sage_compute_tensor_stats(data, t->type, t->ne, t->nb);
+-    common_sage_write_jsonl(pimpl->output, pimpl->sequence++, t, stats);
+-    pimpl->output.flush();
++    const int64_t sequence = pimpl->sequence++;
++    if (std::string(t->name) == "ffn_norm-0") {
++        pimpl->latest_ffn_norm_0.has      = true;
++        pimpl->latest_ffn_norm_0.sequence = sequence;
++        pimpl->latest_ffn_norm_0.name     = t->name;
++        pimpl->latest_ffn_norm_0.stats    = stats;
++    }
++    if (pimpl->stats_output.is_open()) {
++        common_sage_write_jsonl(pimpl->stats_output, sequence, t, stats);
++        pimpl->stats_output.flush();
++    }
+ 
+     return true;
+ }
+diff --git a/common/sage.h b/common/sage.h
+index 24ed465..49fd30b 100644
+--- a/common/sage.h
++++ b/common/sage.h
+@@ -10,6 +10,14 @@
+ // verifier signal without using llama-debug tensor dumps.
+ bool common_sage_cb_eval(struct ggml_tensor * t, bool ask, void * user_data);
+ 
++struct common_sage_decision_params {
++    std::string output_path;
++    std::string candidate_id;
++    std::string token_class;
++    double      proxy_entropy = 0.0;
++    double      proxy_margin  = 0.0;
++};
++
+ struct common_sage_cb_user_data {
+     struct impl;
+     std::unique_ptr<impl> pimpl;
+@@ -20,5 +28,8 @@ struct common_sage_cb_user_data {
+     common_sage_cb_user_data(const common_sage_cb_user_data &) = delete;
+     common_sage_cb_user_data & operator=(const common_sage_cb_user_data &) = delete;
+ 
+-    common_sage_cb_user_data(const std::vector<std::string> & filter_patterns, const std::string & output_path);
++    common_sage_cb_user_data(
++            const std::vector<std::string> & filter_patterns,
++            const std::string &              stats_output_path,
++            const common_sage_decision_params & decision_params);
+ };

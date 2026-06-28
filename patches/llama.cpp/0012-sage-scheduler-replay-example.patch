@@ -1,0 +1,264 @@
+diff --git a/examples/CMakeLists.txt b/examples/CMakeLists.txt
+index 3f9b2c64..a91a3849 100644
+--- a/examples/CMakeLists.txt
++++ b/examples/CMakeLists.txt
+@@ -28,6 +28,7 @@ else()
+     add_subdirectory(passkey)
+     add_subdirectory(retrieval)
+     add_subdirectory(sage-policy-check)
++    add_subdirectory(sage-scheduler-replay)
+     add_subdirectory(simple)
+     add_subdirectory(simple-chat)
+     add_subdirectory(speculative)
+diff --git a/examples/sage-scheduler-replay/CMakeLists.txt b/examples/sage-scheduler-replay/CMakeLists.txt
+new file mode 100644
+index 00000000..1f16ab48
+--- /dev/null
++++ b/examples/sage-scheduler-replay/CMakeLists.txt
+@@ -0,0 +1,5 @@
++set(TARGET llama-sage-scheduler-replay)
++add_executable(${TARGET} sage-scheduler-replay.cpp)
++install(TARGETS ${TARGET} RUNTIME)
++target_link_libraries(${TARGET} PRIVATE llama-common llama ${CMAKE_THREAD_LIBS_INIT})
++target_compile_features(${TARGET} PRIVATE cxx_std_17)
+diff --git a/examples/sage-scheduler-replay/sage-scheduler-replay.cpp b/examples/sage-scheduler-replay/sage-scheduler-replay.cpp
+new file mode 100644
+index 00000000..f45b50e6
+--- /dev/null
++++ b/examples/sage-scheduler-replay/sage-scheduler-replay.cpp
+@@ -0,0 +1,235 @@
++#include "sage.h"
++
++#include <nlohmann/json.hpp>
++
++#include <cstdio>
++#include <cstdlib>
++#include <fstream>
++#include <iostream>
++#include <map>
++#include <string>
++#include <vector>
++
++using json = nlohmann::ordered_json;
++
++struct scheduler_row {
++    int                         index       = 0;
++    int                         prompt_index = 0;
++    int                         step_index  = 0;
++    std::string                 prompt;
++    std::string                 proxy_token;
++    std::string                 oracle_token;
++    bool                        top1_match  = false;
++    bool                        has_top1_match = false;
++    common_sage_policy_input    input;
++};
++
++struct scheduler_summary {
++    int rows = 0;
++    int prompt_count = 0;
++    int proxy_gate_accepts = 0;
++    int verifier_needed = 0;
++    int verifier_covered = 0;
++    int accepted_proxy = 0;
++    int oracle_fallbacks = 0;
++    int false_accepts = 0;
++};
++
++static void print_usage(const char * argv0) {
++    std::fprintf(stderr,
++            "usage: %s --jsonl-in PATH [--json-out PATH] [--self-test]\n",
++            argv0);
++}
++
++static bool action_accepts_proxy(const common_sage_policy_result & result) {
++    return std::string(result.action) == "accept_proxy";
++}
++
++static int json_int(const json & row, const char * key, int fallback) {
++    if (!row.contains(key) || row.at(key).is_null()) {
++        return fallback;
++    }
++    return row.at(key).get<int>();
++}
++
++static std::string json_string(const json & row, const char * key, const std::string & fallback = "") {
++    if (!row.contains(key) || row.at(key).is_null()) {
++        return fallback;
++    }
++    return row.at(key).get<std::string>();
++}
++
++static scheduler_row scheduler_row_from_json(const json & raw, int index) {
++    scheduler_row row;
++    row.index = index;
++    row.prompt_index = json_int(raw, "prompt_index", 0);
++    row.step_index = json_int(raw, "step_index", index);
++    row.prompt = json_string(raw, "prompt");
++    row.proxy_token = json_string(raw, "proxy_token");
++    row.oracle_token = json_string(raw, "oracle_token");
++    if (raw.contains("top1_match") && raw.at("top1_match").is_boolean()) {
++        row.top1_match = raw.at("top1_match").get<bool>();
++        row.has_top1_match = true;
++    } else if (raw.contains("replay_top1_token_match") && raw.at("replay_top1_token_match").is_boolean()) {
++        row.top1_match = raw.at("replay_top1_token_match").get<bool>();
++        row.has_top1_match = true;
++    }
++
++    row.input.candidate_id = json_string(raw, "candidate_id", json_string(raw, "task_id"));
++    row.input.token_class = raw.at("token_class").get<std::string>();
++    row.input.proxy_entropy = raw.at("proxy_entropy").get<double>();
++    row.input.proxy_margin = raw.at("proxy_margin").get<double>();
++    if (raw.contains("ffn_norm_0_sequence") && !raw.at("ffn_norm_0_sequence").is_null()) {
++        row.input.ffn_norm_0_sequence = raw.at("ffn_norm_0_sequence").get<int64_t>();
++    }
++    if (raw.contains("ffn_norm_0_sum") && !raw.at("ffn_norm_0_sum").is_null()) {
++        row.input.ffn_norm_0_sum = raw.at("ffn_norm_0_sum").get<double>();
++        row.input.has_ffn_norm_0 = true;
++    }
++    return row;
++}
++
++static json decision_to_json(
++        const scheduler_row &              row,
++        const common_sage_policy_result &  result,
++        const std::string &                prefix_before) {
++    const bool accept_proxy = action_accepts_proxy(result);
++    const std::string selected_token = accept_proxy ? row.proxy_token : row.oracle_token;
++    json out;
++    out["index"] = row.index;
++    out["candidate_id"] = row.input.candidate_id;
++    out["prompt_index"] = row.prompt_index;
++    out["step_index"] = row.step_index;
++    out["prefix_before"] = prefix_before;
++    out["token_class"] = row.input.token_class;
++    out["proxy_token"] = row.proxy_token;
++    out["oracle_token"] = row.oracle_token;
++    out["top1_match"] = row.has_top1_match ? json(row.top1_match) : json(nullptr);
++    out["proxy_entropy"] = row.input.proxy_entropy;
++    out["proxy_margin"] = row.input.proxy_margin;
++    out["proxy_gate_accept"] = result.proxy_gate_accept;
++    out["verifier_needed"] = result.verifier_needed;
++    out["verifier_covered"] = result.verifier_covered;
++    out["verifier_accept"] = result.verifier_covered ? json(result.verifier_accept) : json(nullptr);
++    out["action"] = result.action;
++    out["reason"] = result.reason;
++    out["selected_token"] = selected_token;
++    out["false_accept"] = row.has_top1_match ? json(accept_proxy && !row.top1_match) : json(nullptr);
++    out["generated_text_after"] = prefix_before + selected_token;
++    return out;
++}
++
++static json summary_to_json(const scheduler_summary & summary, const std::map<int, std::string> & generated_by_prompt) {
++    json out;
++    out["rows"] = summary.rows;
++    out["prompt_count"] = summary.prompt_count;
++    out["proxy_gate_accepts"] = summary.proxy_gate_accepts;
++    out["verifier_needed"] = summary.verifier_needed;
++    out["verifier_covered"] = summary.verifier_covered;
++    out["accepted_proxy"] = summary.accepted_proxy;
++    out["oracle_fallbacks"] = summary.oracle_fallbacks;
++    out["false_accepts"] = summary.false_accepts;
++    json prompts = json::object();
++    for (const auto & item : generated_by_prompt) {
++        prompts[std::to_string(item.first)] = item.second;
++    }
++    out["generated_by_prompt"] = prompts;
++    return out;
++}
++
++static int run_scheduler(const std::string & input_path, const std::string & output_path) {
++    std::ifstream input(input_path);
++    if (!input.is_open()) {
++        std::fprintf(stderr, "failed to open --jsonl-in: %s\n", input_path.c_str());
++        return 1;
++    }
++
++    std::vector<json> decisions;
++    std::map<int, std::string> generated_by_prompt;
++    scheduler_summary summary;
++
++    std::string line;
++    int line_number = 0;
++    while (std::getline(input, line)) {
++        line_number++;
++        if (line.empty()) {
++            continue;
++        }
++        try {
++            const scheduler_row row = scheduler_row_from_json(json::parse(line), (int) decisions.size());
++            std::string & prefix = generated_by_prompt[row.prompt_index];
++            const common_sage_policy_result result = common_sage_decide(row.input);
++            const json decision = decision_to_json(row, result, prefix);
++            prefix = decision.at("generated_text_after").get<std::string>();
++
++            summary.rows++;
++            summary.proxy_gate_accepts += result.proxy_gate_accept ? 1 : 0;
++            summary.verifier_needed += result.verifier_needed ? 1 : 0;
++            summary.verifier_covered += result.verifier_covered ? 1 : 0;
++            summary.accepted_proxy += action_accepts_proxy(result) ? 1 : 0;
++            summary.oracle_fallbacks += action_accepts_proxy(result) ? 0 : 1;
++            summary.false_accepts += row.has_top1_match && action_accepts_proxy(result) && !row.top1_match ? 1 : 0;
++            decisions.push_back(decision);
++        } catch (const std::exception & e) {
++            std::fprintf(stderr, "failed to process JSONL line %d: %s\n", line_number, e.what());
++            return 1;
++        }
++    }
++
++    summary.prompt_count = (int) generated_by_prompt.size();
++    json output;
++    output["summary"] = summary_to_json(summary, generated_by_prompt);
++    output["decisions"] = decisions;
++
++    if (output_path.empty() || output_path == "-") {
++        std::cout << output.dump(2) << "\n";
++    } else {
++        std::ofstream out(output_path, std::ios::out | std::ios::trunc);
++        if (!out.is_open()) {
++            std::fprintf(stderr, "failed to open --json-out: %s\n", output_path.c_str());
++            return 1;
++        }
++        out << output.dump(2) << "\n";
++    }
++    return 0;
++}
++
++static int run_self_test() {
++    common_sage_policy_input input;
++    input.candidate_id = "self";
++    input.token_class = "whitespace";
++    input.proxy_entropy = 0.5;
++    input.proxy_margin = 0.1;
++    const common_sage_policy_result result = common_sage_decide(input);
++    if (!action_accepts_proxy(result)) {
++        std::fprintf(stderr, "self-test expected proxy accept\n");
++        return 1;
++    }
++    std::printf("SAGE scheduler replay self-test passed\n");
++    return 0;
++}
++
++int main(int argc, char ** argv) {
++    std::string jsonl_in;
++    std::string json_out;
++
++    for (int i = 1; i < argc; ++i) {
++        const std::string arg = argv[i];
++        if (arg == "--self-test") {
++            return run_self_test();
++        } else if (arg == "--jsonl-in" && i + 1 < argc) {
++            jsonl_in = argv[++i];
++        } else if (arg == "--json-out" && i + 1 < argc) {
++            json_out = argv[++i];
++        } else {
++            print_usage(argv[0]);
++            return 1;
++        }
++    }
++
++    if (jsonl_in.empty()) {
++        print_usage(argv[0]);
++        return 1;
++    }
++    return run_scheduler(jsonl_in, json_out);
++}

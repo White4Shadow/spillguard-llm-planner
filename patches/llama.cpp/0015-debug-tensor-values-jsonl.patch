@@ -1,0 +1,169 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 10b73a6d..1f3a1f5a 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -4042,6 +4042,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.tensor_stats = true;
+         }
+     ).set_examples({LLAMA_EXAMPLE_DEBUG}));
++    add_opt(common_arg(
++        {"--tensor-values-output"}, "PATH",
++        "write bounded tensor value slices to a JSONL sidecar file and enable --tensor-stats",
++        [](common_params & params, const std::string & value) {
++            params.tensor_values_output = value;
++            params.tensor_stats = true;
++        }
++    ).set_examples({LLAMA_EXAMPLE_DEBUG}));
++    add_opt(common_arg(
++        {"--tensor-values-limit"}, "N",
++        string_format("max values per matched tensor slice for --tensor-values-output (default: %d)", params.tensor_values_limit),
++        [](common_params & params, int value) {
++            params.tensor_values_limit = value;
++        }
++    ).set_examples({LLAMA_EXAMPLE_DEBUG}));
++    add_opt(common_arg(
++        {"--tensor-values-i1"}, "N",
++        string_format("i1 slice for --tensor-values-output; -1 selects last slice (default: %d)", params.tensor_values_i1),
++        [](common_params & params, int value) {
++            params.tensor_values_i1 = value;
++        }
++    ).set_examples({LLAMA_EXAMPLE_DEBUG}));
+ 
+     // presets
+     add_opt(common_arg(
+diff --git a/common/common.h b/common/common.h
+index a6ec458d..3b6cc8e0 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -506,11 +506,14 @@ struct common_params {
+     std::string path_prompts_log_dir = ""; // directory with logged prompts                                 // NOLINT
+ 
+     // llama-debug specific options
+-    std::string logits_output_dir    = "data"; // directory for saving logits output files                  // NOLINT
+-    std::string tensor_stats_output  = "";     // JSONL path for compact tensor statistics                  // NOLINT
+-    bool        save_logits          = false;  // whether to save logits to files                           // NOLINT
+-    bool        tensor_stats         = false;  // print compact tensor statistics instead of tensor values   // NOLINT
+-    std::vector<std::string> tensor_filter;    // filter tensor names for debug output (regex)              // NOLINT
++    std::string logits_output_dir     = "data"; // directory for saving logits output files                  // NOLINT
++    std::string tensor_stats_output   = "";     // JSONL path for compact tensor statistics                  // NOLINT
++    std::string tensor_values_output  = "";     // JSONL path for bounded tensor value slices                // NOLINT
++    int32_t     tensor_values_limit   = 0;      // max values per matched tensor slice; 0 disables           // NOLINT
++    int32_t     tensor_values_i1      = -1;     // i1 slice for tensor values; -1 means last                 // NOLINT
++    bool        save_logits           = false;  // whether to save logits to files                           // NOLINT
++    bool        tensor_stats          = false;  // print compact tensor statistics instead of tensor values   // NOLINT
++    std::vector<std::string> tensor_filter;     // filter tensor names for debug output (regex)              // NOLINT
+ 
+     std::vector<std::string> in_files;   // all input files
+     std::vector<std::string> antiprompt; // strings upon which more user input is prompted (a.k.a. reverse prompts)
+diff --git a/common/debug.cpp b/common/debug.cpp
+index f80af9cf..83d9c3b4 100644
+--- a/common/debug.cpp
++++ b/common/debug.cpp
+@@ -19,7 +19,11 @@ struct common_debug_cb_user_data::impl {
+     std::vector<uint8_t>    data;
+     std::vector<std::regex> tensor_filters;
+     std::ofstream           tensor_stats_output;
++    std::ofstream           tensor_values_output;
+     int64_t                 tensor_stats_sequence{0};
++    int64_t                 tensor_values_sequence{0};
++    int32_t                 tensor_values_limit{0};
++    int32_t                 tensor_values_i1{-1};
+     bool                    tensor_stats{false};
+     bool                    abort_on_nan{false};
+ };
+@@ -43,14 +47,25 @@ common_debug_cb_user_data::common_debug_cb_user_data(common_params & params, con
+             throw std::runtime_error("Invalid regex pattern '" + pattern + "': " + e.what());
+         }
+     }
+-    pimpl->tensor_stats = params.tensor_stats || !params.tensor_stats_output.empty();
++    pimpl->tensor_stats = params.tensor_stats || !params.tensor_stats_output.empty() || !params.tensor_values_output.empty();
+     pimpl->abort_on_nan = abort_on_nan;
++    pimpl->tensor_values_limit = params.tensor_values_limit;
++    pimpl->tensor_values_i1 = params.tensor_values_i1;
+     if (!params.tensor_stats_output.empty()) {
+         pimpl->tensor_stats_output.open(params.tensor_stats_output, std::ios::out | std::ios::trunc);
+         if (!pimpl->tensor_stats_output.is_open()) {
+             throw std::runtime_error("failed to open --tensor-stats-output: " + params.tensor_stats_output);
+         }
+     }
++    if (!params.tensor_values_output.empty()) {
++        if (params.tensor_values_limit <= 0) {
++            throw std::runtime_error("--tensor-values-output requires --tensor-values-limit > 0");
++        }
++        pimpl->tensor_values_output.open(params.tensor_values_output, std::ios::out | std::ios::trunc);
++        if (!pimpl->tensor_values_output.is_open()) {
++            throw std::runtime_error("failed to open --tensor-values-output: " + params.tensor_values_output);
++        }
++    }
+ 
+     params.cb_eval           = common_debug_cb_eval;
+     params.cb_eval_user_data = this;
+@@ -177,6 +192,51 @@ static void common_debug_write_tensor_stats_jsonl(
+     out << ",\"nan_count\":" << (long long) stats.nan_count << "}\n";
+ }
+ 
++static void common_debug_write_tensor_values_jsonl(
++        std::ostream &             out,
++        int64_t                    sequence,
++        const struct ggml_tensor * t,
++        uint8_t *                  data,
++        int32_t                    value_limit,
++        int32_t                    requested_i1) {
++    const int64_t n0 = t->ne[0];
++    const int64_t n1 = t->ne[1];
++    if (n0 <= 0 || n1 <= 0 || value_limit <= 0) {
++        return;
++    }
++    int64_t i1 = requested_i1 < 0 ? n1 - 1 : requested_i1;
++    if (i1 < 0) {
++        i1 = 0;
++    }
++    if (i1 >= n1) {
++        i1 = n1 - 1;
++    }
++    const int64_t n_emit = std::min<int64_t>(n0, value_limit);
++
++    out << "{\"sequence\":" << (long long) sequence;
++    out << ",\"name\":";
++    common_debug_write_json_string(out, t->name);
++    out << ",\"dtype\":";
++    common_debug_write_json_string(out, ggml_type_name(t->type));
++    out << ",\"op\":";
++    common_debug_write_json_string(out, ggml_op_desc(t));
++    out << ",\"shape\":[" << (long long) t->ne[0] << ',' << (long long) t->ne[1] << ','
++        << (long long) t->ne[2] << ',' << (long long) t->ne[3] << ']';
++    out << ",\"i1\":" << (long long) i1;
++    out << ",\"axis\":\"i0\"";
++    out << ",\"count\":" << (long long) n0;
++    out << ",\"emitted\":" << (long long) n_emit;
++    out << ",\"truncated\":" << (n_emit < n0 ? "true" : "false");
++    out << ",\"values\":[";
++    for (int64_t i0 = 0; i0 < n_emit; ++i0) {
++        if (i0 > 0) {
++            out << ',';
++        }
++        common_debug_write_json_number(out, common_ggml_get_float_value(data, t->type, t->nb, i0, i1, 0, 0));
++    }
++    out << "]}\n";
++}
++
+ static void common_debug_print_tensor(
+         uint8_t *                         data,
+         ggml_type                         type,
+@@ -301,6 +358,16 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
+             common_debug_write_tensor_stats_jsonl(pimpl->tensor_stats_output, pimpl->tensor_stats_sequence++, t, stats);
+             pimpl->tensor_stats_output.flush();
+         }
++        if (pimpl->tensor_values_output.is_open()) {
++            common_debug_write_tensor_values_jsonl(
++                pimpl->tensor_values_output,
++                pimpl->tensor_values_sequence++,
++                t,
++                data,
++                pimpl->tensor_values_limit,
++                pimpl->tensor_values_i1);
++            pimpl->tensor_values_output.flush();
++        }
+         common_debug_print_tensor(data, t->type, t->ne, t->nb, 3, stats, pimpl->abort_on_nan, pimpl->tensor_stats);
+     }
+ 

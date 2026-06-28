@@ -1,0 +1,394 @@
+diff --git a/examples/CMakeLists.txt b/examples/CMakeLists.txt
+index a91a3849..f32e5a10 100644
+--- a/examples/CMakeLists.txt
++++ b/examples/CMakeLists.txt
+@@ -30,5 +30,6 @@ else()
+     add_subdirectory(retrieval)
+     add_subdirectory(sage-policy-check)
++    add_subdirectory(sage-proxy-live)
+     add_subdirectory(sage-scheduler-replay)
+     add_subdirectory(simple)
+     add_subdirectory(simple-chat)
+diff --git a/examples/sage-proxy-live/CMakeLists.txt b/examples/sage-proxy-live/CMakeLists.txt
+new file mode 100644
+index 00000000..17000c74
+--- /dev/null
++++ b/examples/sage-proxy-live/CMakeLists.txt
+@@ -0,0 +1,5 @@
++set(TARGET llama-sage-proxy-live)
++add_executable(${TARGET} sage-proxy-live.cpp)
++install(TARGETS ${TARGET} RUNTIME)
++target_link_libraries(${TARGET} PRIVATE llama-common llama ${CMAKE_THREAD_LIBS_INIT})
++target_compile_features(${TARGET} PRIVATE cxx_std_17)
+diff --git a/examples/sage-proxy-live/sage-proxy-live.cpp b/examples/sage-proxy-live/sage-proxy-live.cpp
+new file mode 100644
+index 00000000..928ed0f3
+--- /dev/null
++++ b/examples/sage-proxy-live/sage-proxy-live.cpp
+@@ -0,0 +1,366 @@
++#include "sage.h"
++#include "llama.h"
++
++#include <nlohmann/json.hpp>
++
++#include <algorithm>
++#include <chrono>
++#include <clocale>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cctype>
++#include <cstring>
++#include <fstream>
++#include <limits>
++#include <string>
++#include <vector>
++
++using json = nlohmann::ordered_json;
++
++struct proxy_params {
++    std::string model_path;
++    std::string prompt = "The capital of France is";
++    std::string json_out;
++    int n_gpu_layers = 99;
++    int n_predict = 16;
++    int n_ctx = 0;
++};
++
++struct logit_stats {
++    llama_token top1_id = LLAMA_TOKEN_NULL;
++    llama_token top2_id = LLAMA_TOKEN_NULL;
++    double top1_logit = -std::numeric_limits<double>::infinity();
++    double top2_logit = -std::numeric_limits<double>::infinity();
++    double margin = 0.0;
++    double entropy = 0.0;
++};
++
++static void print_usage(const char * argv0) {
++    std::fprintf(stderr,
++            "usage: %s [--self-test] -m model.gguf [-ngl n] [-n tokens] [-c ctx] [--json-out PATH] [prompt]\n",
++            argv0);
++}
++
++static bool parse_int(const char * raw, int & out) {
++    char * end = nullptr;
++    long value = std::strtol(raw, &end, 10);
++    if (end == raw || end == nullptr || *end != '\0') {
++        return false;
++    }
++    out = (int) value;
++    return true;
++}
++
++static std::string token_to_piece(const llama_vocab * vocab, llama_token token) {
++    std::string piece;
++    piece.resize(piece.capacity());
++    int n_chars = llama_token_to_piece(vocab, token, &piece[0], piece.size(), 0, true);
++    if (n_chars < 0) {
++        piece.resize(-n_chars);
++        n_chars = llama_token_to_piece(vocab, token, &piece[0], piece.size(), 0, true);
++        if (n_chars < 0) {
++            return "";
++        }
++    }
++    piece.resize(n_chars);
++    return piece;
++}
++
++static std::string trim_ascii(const std::string & text) {
++    size_t begin = 0;
++    while (begin < text.size() && std::isspace((unsigned char) text[begin])) {
++        begin++;
++    }
++    size_t end = text.size();
++    while (end > begin && std::isspace((unsigned char) text[end - 1])) {
++        end--;
++    }
++    return text.substr(begin, end - begin);
++}
++
++static std::string token_class(const std::string & token) {
++    const std::string stripped = trim_ascii(token);
++    if (stripped.empty()) {
++        return "whitespace";
++    }
++    if (stripped.size() >= 4 && stripped.rfind("<|", 0) == 0 && stripped.substr(stripped.size() - 2) == "|>") {
++        return "control";
++    }
++
++    bool all_punct = true;
++    bool all_digit = true;
++    for (unsigned char c : stripped) {
++        all_punct = all_punct && !std::isalnum(c);
++        all_digit = all_digit && std::isdigit(c);
++    }
++    if (all_punct) {
++        return "punct";
++    }
++    if (all_digit) {
++        return "number";
++    }
++    if (!stripped.empty() && std::isupper((unsigned char) stripped[0])) {
++        return "capitalized";
++    }
++    return "word";
++}
++
++static logit_stats compute_logit_stats(const float * logits, int n_vocab) {
++    logit_stats stats;
++    double max_logit = -std::numeric_limits<double>::infinity();
++    for (int i = 0; i < n_vocab; ++i) {
++        const double value = logits[i];
++        if (value > stats.top1_logit) {
++            stats.top2_logit = stats.top1_logit;
++            stats.top2_id = stats.top1_id;
++            stats.top1_logit = value;
++            stats.top1_id = i;
++        } else if (value > stats.top2_logit) {
++            stats.top2_logit = value;
++            stats.top2_id = i;
++        }
++        max_logit = std::max(max_logit, value);
++    }
++
++    double sum_exp = 0.0;
++    double weighted = 0.0;
++    for (int i = 0; i < n_vocab; ++i) {
++        const double shifted = (double) logits[i] - max_logit;
++        const double exp_value = std::exp(shifted);
++        sum_exp += exp_value;
++        weighted += exp_value * shifted;
++    }
++    if (sum_exp > 0.0) {
++        stats.entropy = std::log(sum_exp) - weighted / sum_exp;
++    }
++    stats.margin = stats.top1_logit - stats.top2_logit;
++    return stats;
++}
++
++static bool parse_args(int argc, char ** argv, proxy_params & params) {
++    int i = 1;
++    for (; i < argc; ++i) {
++        if (std::strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
++            params.model_path = argv[++i];
++        } else if (std::strcmp(argv[i], "-ngl") == 0 && i + 1 < argc) {
++            if (!parse_int(argv[++i], params.n_gpu_layers)) {
++                return false;
++            }
++        } else if (std::strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
++            if (!parse_int(argv[++i], params.n_predict)) {
++                return false;
++            }
++        } else if (std::strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
++            if (!parse_int(argv[++i], params.n_ctx)) {
++                return false;
++            }
++        } else if (std::strcmp(argv[i], "--json-out") == 0 && i + 1 < argc) {
++            params.json_out = argv[++i];
++        } else {
++            break;
++        }
++    }
++
++    if (i < argc) {
++        params.prompt = argv[i++];
++        for (; i < argc; ++i) {
++            params.prompt += " ";
++            params.prompt += argv[i];
++        }
++    }
++    return !params.model_path.empty() && params.n_predict >= 0;
++}
++
++static int run_self_test() {
++    const float logits[] = {0.0f, 3.0f, 1.0f};
++    const logit_stats stats = compute_logit_stats(logits, 3);
++    if (stats.top1_id != 1 || stats.top2_id != 2 || stats.margin < 1.99 || stats.margin > 2.01) {
++        std::fprintf(stderr, "sage-proxy-live self-test failed: logit stats\n");
++        return 1;
++    }
++    if (token_class(" Paris") != "capitalized" ||
++            token_class(".") != "punct" ||
++            token_class("  ") != "whitespace" ||
++            token_class("42") != "number" ||
++            token_class(" is") != "word") {
++        std::fprintf(stderr, "sage-proxy-live self-test failed: token class\n");
++        return 1;
++    }
++    std::printf("SAGE proxy live self-test passed\n");
++    return 0;
++}
++
++int main(int argc, char ** argv) {
++    std::setlocale(LC_NUMERIC, "C");
++
++    if (argc == 2 && std::strcmp(argv[1], "--self-test") == 0) {
++        return run_self_test();
++    }
++
++    proxy_params params;
++    if (!parse_args(argc, argv, params)) {
++        print_usage(argv[0]);
++        return 1;
++    }
++
++    ggml_backend_load_all();
++
++    llama_model_params model_params = llama_model_default_params();
++    model_params.n_gpu_layers = params.n_gpu_layers;
++
++    llama_model * model = llama_model_load_from_file(params.model_path.c_str(), model_params);
++    if (model == nullptr) {
++        std::fprintf(stderr, "sage-proxy-live: failed to load model\n");
++        return 1;
++    }
++
++    const llama_vocab * vocab = llama_model_get_vocab(model);
++    const int n_prompt = -llama_tokenize(vocab, params.prompt.c_str(), params.prompt.size(), nullptr, 0, true, true);
++    if (n_prompt <= 0) {
++        std::fprintf(stderr, "sage-proxy-live: failed to size prompt tokens\n");
++        llama_model_free(model);
++        return 1;
++    }
++
++    std::vector<llama_token> prompt_tokens(n_prompt);
++    if (llama_tokenize(vocab, params.prompt.c_str(), params.prompt.size(), prompt_tokens.data(), prompt_tokens.size(), true, true) < 0) {
++        std::fprintf(stderr, "sage-proxy-live: failed to tokenize prompt\n");
++        llama_model_free(model);
++        return 1;
++    }
++
++    llama_context_params ctx_params = llama_context_default_params();
++    ctx_params.n_ctx = params.n_ctx > 0 ? params.n_ctx : std::max(n_prompt + params.n_predict + 8, 32);
++    ctx_params.n_batch = std::max(n_prompt, 1);
++    ctx_params.no_perf = false;
++
++    llama_context * ctx = llama_init_from_model(model, ctx_params);
++    if (ctx == nullptr) {
++        std::fprintf(stderr, "sage-proxy-live: failed to create context\n");
++        llama_model_free(model);
++        return 1;
++    }
++
++    auto sparams = llama_sampler_chain_default_params();
++    sparams.no_perf = false;
++    llama_sampler * sampler = llama_sampler_chain_init(sparams);
++    llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
++
++    llama_batch batch = llama_batch_get_one(prompt_tokens.data(), prompt_tokens.size());
++    if (llama_model_has_encoder(model)) {
++        if (llama_encode(ctx, batch)) {
++            std::fprintf(stderr, "sage-proxy-live: encoder eval failed\n");
++            llama_sampler_free(sampler);
++            llama_free(ctx);
++            llama_model_free(model);
++            return 1;
++        }
++        llama_token decoder_start = llama_model_decoder_start_token(model);
++        if (decoder_start == LLAMA_TOKEN_NULL) {
++            decoder_start = llama_vocab_bos(vocab);
++        }
++        batch = llama_batch_get_one(&decoder_start, 1);
++    }
++
++    const auto started = std::chrono::steady_clock::now();
++    json steps = json::array();
++    std::string generated_text;
++    int n_decode = 0;
++    int n_pos = 0;
++    const int n_vocab = llama_vocab_n_tokens(vocab);
++
++    for (; n_decode < params.n_predict; ++n_decode) {
++        if (llama_decode(ctx, batch)) {
++            std::fprintf(stderr, "sage-proxy-live: llama_decode failed\n");
++            llama_sampler_free(sampler);
++            llama_free(ctx);
++            llama_model_free(model);
++            return 1;
++        }
++        n_pos += batch.n_tokens;
++
++        const float * logits = llama_get_logits_ith(ctx, -1);
++        if (logits == nullptr) {
++            std::fprintf(stderr, "sage-proxy-live: logits unavailable\n");
++            llama_sampler_free(sampler);
++            llama_free(ctx);
++            llama_model_free(model);
++            return 1;
++        }
++        const logit_stats stats = compute_logit_stats(logits, n_vocab);
++        llama_token token_id = llama_sampler_sample(sampler, ctx, -1);
++        if (llama_vocab_is_eog(vocab, token_id)) {
++            break;
++        }
++
++        const std::string piece = token_to_piece(vocab, token_id);
++        const std::string cls = token_class(piece);
++        generated_text += piece;
++
++        common_sage_policy_input policy_input;
++        policy_input.candidate_id = "live-" + std::to_string(n_decode);
++        policy_input.token_class = cls;
++        policy_input.proxy_entropy = stats.entropy;
++        policy_input.proxy_margin = stats.margin;
++        const common_sage_policy_result policy = common_sage_decide(policy_input);
++
++        json row;
++        row["step_index"] = n_decode;
++        row["position"] = n_pos;
++        row["token_id"] = token_id;
++        row["token"] = piece;
++        row["token_class"] = cls;
++        row["proxy_entropy"] = stats.entropy;
++        row["proxy_margin"] = stats.margin;
++        row["logit_top1_id"] = stats.top1_id;
++        row["logit_top2_id"] = stats.top2_id;
++        row["logit_top1"] = stats.top1_logit;
++        row["logit_top2"] = stats.top2_logit;
++        row["sampled_is_logit_top1"] = token_id == stats.top1_id;
++        row["proxy_gate_accept"] = policy.proxy_gate_accept;
++        row["verifier_needed"] = policy.verifier_needed;
++        row["action_without_verifier"] = policy.action;
++        row["reason_without_verifier"] = policy.reason;
++        steps.push_back(row);
++
++        batch = llama_batch_get_one(&token_id, 1);
++    }
++
++    const auto finished = std::chrono::steady_clock::now();
++    const double elapsed_sec = std::chrono::duration<double>(finished - started).count();
++
++    json output;
++    output["summary"] = {
++        {"model", params.model_path},
++        {"prompt", params.prompt},
++        {"prompt_tokens", n_prompt},
++        {"generated_tokens", n_decode},
++        {"final_text", generated_text},
++        {"elapsed_sec", elapsed_sec},
++        {"tokens_per_sec", elapsed_sec > 0.0 ? n_decode / elapsed_sec : 0.0},
++        {"proxy_gate_accepts", std::count_if(steps.begin(), steps.end(), [](const json & row) {
++             return row.value("proxy_gate_accept", false);
++         })},
++    };
++    output["steps"] = steps;
++
++    if (params.json_out.empty() || params.json_out == "-") {
++        std::printf("%s\n", output.dump(2).c_str());
++    } else {
++        std::ofstream out(params.json_out, std::ios::out | std::ios::trunc);
++        if (!out.is_open()) {
++            std::fprintf(stderr, "sage-proxy-live: failed to open --json-out\n");
++            llama_sampler_free(sampler);
++            llama_free(ctx);
++            llama_model_free(model);
++            return 1;
++        }
++        out << output.dump(2) << "\n";
++    }
++
++    llama_sampler_free(sampler);
++    llama_free(ctx);
++    llama_model_free(model);
++    return 0;
++}
